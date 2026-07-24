@@ -1,0 +1,8 @@
+{
+  "server": "proxy.example.com",
+  "port": 10800,
+  "username": "1234567890123456789",
+  "password": "replace-with-your-password",
+  "method": "0x80",
+  "handshake_timeout": "10s"
+}

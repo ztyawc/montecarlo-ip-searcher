@@ -18,6 +18,7 @@ import (
 	"github.com/Leo-Mu/montecarlo-ip-searcher/internal/dns"
 	"github.com/Leo-Mu/montecarlo-ip-searcher/internal/engine"
 	"github.com/Leo-Mu/montecarlo-ip-searcher/internal/output"
+	"github.com/Leo-Mu/montecarlo-ip-searcher/internal/privatesocks"
 	"github.com/Leo-Mu/montecarlo-ip-searcher/internal/probe"
 )
 
@@ -110,6 +111,14 @@ func main() {
 		rounds    int
 		skipFirst int
 
+		// Optional private SOCKS proxy
+		privateSOCKSConfigPath string
+		privateSOCKSAddress    string
+		privateSOCKSUsername   string
+		privateSOCKSPassword   string
+		privateSOCKSMethod     string
+		privateSOCKSTimeout    time.Duration
+
 		// Colo filter
 		coloAllow   string
 		coloExclude string
@@ -158,11 +167,25 @@ func main() {
 	flag.IntVar(&rounds, "rounds", 6, "Number of probe rounds per IP (default: 6)")
 	flag.IntVar(&skipFirst, "skip-first", 1, "Skip first N rounds when calculating average (default: 1, skips handshake overhead)")
 
+	// Optional private SOCKS proxy. Credentials may also be provided through
+	// MCIS_PRIVATE_SOCKS_USERNAME and MCIS_PRIVATE_SOCKS_PASSWORD.
+	flag.StringVar(&privateSOCKSConfigPath, "private-socks-config", "", "Path to a cross-platform private SOCKS JSON config file")
+	flag.StringVar(&privateSOCKSAddress, "private-socks", "", "Private SOCKS proxy address as host:port (optional)")
+	flag.StringVar(&privateSOCKSUsername, "private-socks-username", "", "Private SOCKS username (or MCIS_PRIVATE_SOCKS_USERNAME)")
+	flag.StringVar(&privateSOCKSPassword, "private-socks-password", "", "Private SOCKS password (prefer MCIS_PRIVATE_SOCKS_PASSWORD)")
+	flag.StringVar(&privateSOCKSMethod, "private-socks-method", "0x80", "Private SOCKS authentication method (currently only 0x80)")
+	flag.DurationVar(&privateSOCKSTimeout, "private-socks-timeout", 10*time.Second, "Private SOCKS TCP and handshake timeout")
+
 	// Colo filter (CDN node filter by trace colo)
 	flag.StringVar(&coloAllow, "colo", "", "Comma-separated colo whitelist; only these CDN nodes enter results (e.g. HKG,SJC)")
 	flag.StringVar(&coloExclude, "colo-exclude", "", "Comma-separated colo blacklist; exclude these CDN nodes from results (e.g. LAX,DFW)")
 
 	flag.Parse()
+
+	visitedFlags := make(map[string]bool)
+	flag.Visit(func(flagValue *flag.Flag) {
+		visitedFlags[flagValue.Name] = true
+	})
 
 	// Validate --host parameter
 	if !isValidDomain(host) {
@@ -174,6 +197,68 @@ func main() {
 	if coloAllow != "" && coloExclude != "" {
 		fmt.Fprintln(os.Stderr, "error: cannot use both --colo and --colo-exclude; use only one")
 		os.Exit(1)
+	}
+
+	if privateSOCKSConfigPath != "" {
+		fileConfig, err := privatesocks.LoadConfigFile(privateSOCKSConfigPath)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "error:", err)
+			os.Exit(1)
+		}
+		if !visitedFlags["private-socks"] {
+			privateSOCKSAddress = fileConfig.Endpoint()
+		}
+		if !visitedFlags["private-socks-username"] {
+			privateSOCKSUsername = fileConfig.Username
+		}
+		if !visitedFlags["private-socks-password"] {
+			privateSOCKSPassword = fileConfig.Password
+		}
+		if !visitedFlags["private-socks-method"] && fileConfig.Method != "" {
+			privateSOCKSMethod = fileConfig.Method
+		}
+		if !visitedFlags["private-socks-timeout"] && fileConfig.HandshakeTimeout != "" {
+			privateSOCKSTimeout, err = fileConfig.ParseHandshakeTimeout()
+			if err != nil {
+				fmt.Fprintln(os.Stderr, "error:", err)
+				os.Exit(1)
+			}
+		}
+	}
+
+	if privateSOCKSAddress == "" && !visitedFlags["private-socks"] {
+		privateSOCKSAddress = os.Getenv("MCIS_PRIVATE_SOCKS")
+	}
+	if privateSOCKSUsername == "" && !visitedFlags["private-socks-username"] {
+		privateSOCKSUsername = os.Getenv("MCIS_PRIVATE_SOCKS_USERNAME")
+	}
+	if privateSOCKSPassword == "" && !visitedFlags["private-socks-password"] {
+		privateSOCKSPassword = os.Getenv("MCIS_PRIVATE_SOCKS_PASSWORD")
+	}
+
+	var privateSOCKSDialer *privatesocks.Dialer
+	if privateSOCKSAddress != "" {
+		method, err := privatesocks.ParseMethod(privateSOCKSMethod)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "error:", err)
+			os.Exit(1)
+		}
+
+		privateSOCKSConfig := privatesocks.Config{
+			Address:          privateSOCKSAddress,
+			Username:         privateSOCKSUsername,
+			Password:         privateSOCKSPassword,
+			Method:           method,
+			HandshakeTimeout: privateSOCKSTimeout,
+		}
+		privateSOCKSDialer, err = privatesocks.New(privateSOCKSConfig)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "error:", err)
+			os.Exit(1)
+		}
+		if verbose {
+			fmt.Fprintf(os.Stderr, "proxy: private SOCKS enabled address=%s method=0x80\n", privateSOCKSAddress)
+		}
 	}
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -231,6 +316,9 @@ func main() {
 		Rounds:     rounds,
 		SkipFirst:  skipFirst,
 	}
+	if privateSOCKSDialer != nil {
+		probeCfg.DialContext = privateSOCKSDialer.DialContext
+	}
 
 	req := engine.Request{
 		CIDRs:    []string(cidrs),
@@ -259,8 +347,9 @@ func main() {
 			dlBytes = 50_000_000
 		}
 		dlCfg := probe.DownloadConfig{
-			Timeout: dlTimeout,
-			Bytes:   dlBytes,
+			Timeout:     dlTimeout,
+			Bytes:       dlBytes,
+			DialContext: probeCfg.DialContext,
 		}
 		if dlURL != "" {
 			u, err := url.Parse(dlURL)

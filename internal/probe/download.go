@@ -14,11 +14,12 @@ import (
 )
 
 type DownloadConfig struct {
-	Timeout time.Duration
-	Bytes   int64
-	SNI      string
-	HostName string
-	Path     string
+	Timeout     time.Duration
+	Bytes       int64
+	SNI         string
+	HostName    string
+	Path        string
+	DialContext DialContextFunc
 	// CustomURL indicates the user supplied a custom download URL.
 	// When true, the Path is used as-is (no "?bytes=N" appended).
 	CustomURL bool
@@ -58,12 +59,17 @@ func NewDownloadProber(cfg DownloadConfig) *DownloadProber {
 		cfg.Path = "/__down"
 	}
 
-	transport := &http.Transport{
-		Proxy: nil, // critical: ignore HTTP(S)_PROXY and NO_PROXY env vars
-		DialContext: (&net.Dialer{
+	dialContext := cfg.DialContext
+	if dialContext == nil {
+		dialContext = (&net.Dialer{
 			Timeout:   cfg.Timeout,
 			KeepAlive: 30 * time.Second,
-		}).DialContext,
+		}).DialContext
+	}
+
+	transport := &http.Transport{
+		Proxy:                 nil, // critical: ignore HTTP(S)_PROXY and NO_PROXY env vars
+		DialContext:           dialContext,
 		ForceAttemptHTTP2:     true,
 		MaxIdleConns:          64,
 		MaxIdleConnsPerHost:   8,

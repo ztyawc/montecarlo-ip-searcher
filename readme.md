@@ -134,6 +134,79 @@ go run ./cmd/mcis -v --out text --cidr-file ./ipv6cidr.txt --budget 4000 --heads
 
 ## 可选功能
 
+### 私有 SOCKS 0x80 代理优选
+
+默认情况下，延迟探测和下载测速都直接连接候选 IP。配置 `--private-socks` 后，两种测速都会改为通过私有 SOCKS 代理建立到候选 IP 的 TCP 隧道：
+
+```text
+mcis -> 私有 SOCKS 代理 -> 候选 IP:443
+```
+
+该协议不是标准 SOCKS5：它使用私有认证方法 `0x80`，并对客户端发出的所有字节执行 XOR `0xFF`；服务端返回数据保持原样。当前仅支持 TCP 和认证方法 `0x80`。
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `--private-socks-config` | （空） | 跨平台 JSON 配置文件路径 |
+| `--private-socks` | （空） | 代理地址，格式为 `host:port`；为空时保持直连 |
+| `--private-socks-username` | （空） | 19 字节账号，通常从 JSON 配置读取 |
+| `--private-socks-password` | （空） | 密码，通常从 JSON 配置读取 |
+| `--private-socks-method` | `0x80` | 私有认证方法，目前仅支持 `0x80` |
+| `--private-socks-timeout` | `10s` | 连接代理及完成私有 SOCKS 握手的最长时间 |
+
+推荐复制仓库里的 `private-socks.example.json`，保存为 `private-socks.json` 后填写真实配置。JSON 格式在 Windows、macOS 和 Linux 上完全一致：
+
+```json
+{
+  "server": "proxy.example.com",
+  "port": 10800,
+  "username": "1234567890123456789",
+  "password": "your-password",
+  "method": "0x80",
+  "handshake_timeout": "10s"
+}
+```
+
+Linux/macOS：
+
+```bash
+cp private-socks.example.json private-socks.json
+chmod 600 private-socks.json
+
+./mcis -v --out text \
+  --cidr-file ./ipv4cidr.txt \
+  --private-socks-config ./private-socks.json \
+  --timeout 5s \
+  --budget 3000 \
+  --concurrency 50
+```
+
+Windows PowerShell：
+
+```powershell
+Copy-Item .\private-socks.example.json .\private-socks.json
+
+.\mcis.exe -v --out text `
+  --cidr-file .\ipv4cidr.txt `
+  --private-socks-config .\private-socks.json `
+  --timeout 5s `
+  --budget 3000 `
+  --concurrency 50
+```
+
+也可以继续使用环境变量，或直接传入命令行参数：
+
+```bash
+export MCIS_PRIVATE_SOCKS='proxy.example.com:10800'
+export MCIS_PRIVATE_SOCKS_USERNAME='1234567890123456789'
+export MCIS_PRIVATE_SOCKS_PASSWORD='your-password'
+```
+
+配置优先级为：命令行参数 > JSON 配置文件 > 环境变量 > 默认值。这样可以用同一个配置文件，在临时测试时只覆盖某一个参数。
+
+`private-socks.json` 包含明文密码，不要上传到公共仓库或发送给他人；Linux/macOS 建议设置为仅当前用户可读。模板文件只包含示例值。
+
+代理模式测得的是“代理出口到候选 IP”的链路表现，加上本机到代理入口的固定开销，不代表本机直连候选 IP 的性能。私有 SOCKS 握手也计入首轮连接时间；如代理链路较慢，建议把 `--timeout` 调到 `5s` 或更高，并适当降低 `--concurrency`。
+
 ### CDN 节点过滤
 
 根据 CDN 机房代码（colo）过滤结果：
@@ -258,7 +331,7 @@ export CF_ZONE_ID="your_zone_id"
 
 **Q: 代理环境下能用吗？**
 
-本工具**强制直连**，忽略 `HTTP_PROXY/HTTPS_PROXY/NO_PROXY` 环境变量，确保测速结果不被代理影响。
+默认模式仍然**强制直连**，忽略 `HTTP_PROXY/HTTPS_PROXY/NO_PROXY` 环境变量。只有显式设置 `--private-socks` 或 `MCIS_PRIVATE_SOCKS` 时，延迟探测和下载测速才会使用上述私有 SOCKS `0x80` 代理。
 
 ## 构建
 

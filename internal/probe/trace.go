@@ -15,13 +15,17 @@ import (
 )
 
 type Config struct {
-	Timeout    time.Duration
-	SNI        string
-	HostHeader string
-	Path       string
-	Rounds     int // 总测试次数，默认6
-	SkipFirst  int // 跳过前N次，默认1（跳过第1次握手）
+	Timeout     time.Duration
+	SNI         string
+	HostHeader  string
+	Path        string
+	Rounds      int // 总测试次数，默认6
+	SkipFirst   int // 跳过前N次，默认1（跳过第1次握手）
+	DialContext DialContextFunc
 }
+
+// DialContextFunc establishes a TCP connection for an HTTP transport.
+type DialContextFunc func(ctx context.Context, network, address string) (net.Conn, error)
 
 type Result struct {
 	IP        netip.Addr        `json:"ip"`
@@ -41,7 +45,8 @@ type Prober struct {
 	client *http.Client
 }
 
-// NewProber creates a reusable, direct-connection (no proxy) prober.
+// NewProber creates a reusable prober. It connects directly unless a custom
+// DialContext function is configured.
 func NewProber(cfg Config) *Prober {
 	if cfg.Path == "" {
 		cfg.Path = "/cdn-cgi/trace"
@@ -53,12 +58,17 @@ func NewProber(cfg Config) *Prober {
 		cfg.Timeout = 3 * time.Second
 	}
 
-	transport := &http.Transport{
-		Proxy: nil, // critical: ignore HTTP(S)_PROXY and NO_PROXY env vars
-		DialContext: (&net.Dialer{
+	dialContext := cfg.DialContext
+	if dialContext == nil {
+		dialContext = (&net.Dialer{
 			Timeout:   cfg.Timeout,
 			KeepAlive: 30 * time.Second,
-		}).DialContext,
+		}).DialContext
+	}
+
+	transport := &http.Transport{
+		Proxy:                 nil, // critical: ignore HTTP(S)_PROXY and NO_PROXY env vars
+		DialContext:           dialContext,
 		ForceAttemptHTTP2:     true,
 		MaxIdleConns:          1024,
 		MaxIdleConnsPerHost:   256,

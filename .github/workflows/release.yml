@@ -23,4 +23,4 @@ jobs:
         goarch: ${{ matrix.goarch }}
         project_path: "./cmd/mcis"
         binary_name: "mcis"
-        extra_files: LICENSE readme.md ipv4cidr.txt ipv6cidr.txt
+        extra_files: LICENSE readme.md ipv4cidr.txt ipv6cidr.txt private-socks.example.json
