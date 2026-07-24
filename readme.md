@@ -134,7 +134,7 @@ go run ./cmd/mcis -v --out text --cidr-file ./ipv6cidr.txt --budget 4000 --heads
 
 ## 可选功能
 
-### 私有 SOCKS 0x80 代理优选
+### 私有 SOCKS 0x80/0x82 代理优选
 
 默认情况下，延迟探测和下载测速都直接连接候选 IP。配置 `--private-socks` 后，两种测速都会改为通过私有 SOCKS 代理建立到候选 IP 的 TCP 隧道：
 
@@ -142,7 +142,7 @@ go run ./cmd/mcis -v --out text --cidr-file ./ipv6cidr.txt --budget 4000 --heads
 mcis -> 私有 SOCKS 代理 -> 候选 IP:443
 ```
 
-该协议不是标准 SOCKS5：它使用私有认证方法 `0x80`，并对客户端发出的所有字节执行 XOR `0xFF`；服务端返回数据保持原样。当前仅支持 TCP 和认证方法 `0x80`。
+该协议不是标准 SOCKS5：它使用私有认证方法 `0x80` 或 `0x82`，并对客户端发出的所有字节执行 XOR `0xFF`；服务端返回数据保持原样。当前仅支持 TCP。
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
@@ -150,7 +150,7 @@ mcis -> 私有 SOCKS 代理 -> 候选 IP:443
 | `--private-socks` | （空） | 代理地址，格式为 `host:port`；为空时保持直连 |
 | `--private-socks-username` | （空） | 19 字节账号，通常从 JSON 配置读取 |
 | `--private-socks-password` | （空） | 密码，通常从 JSON 配置读取 |
-| `--private-socks-method` | `0x80` | 私有认证方法，目前仅支持 `0x80` |
+| `--private-socks-method` | `0x80` | 私有认证方法，可选 `0x80` 或 `0x82` |
 | `--private-socks-timeout` | `10s` | 连接代理及完成私有 SOCKS 握手的最长时间 |
 
 推荐复制仓库里的 `private-socks.example.json`，保存为 `private-socks.json` 后填写真实配置。JSON 格式在 Windows、macOS 和 Linux 上完全一致：
@@ -165,6 +165,14 @@ mcis -> 私有 SOCKS 代理 -> 候选 IP:443
   "handshake_timeout": "10s"
 }
 ```
+
+需要使用 `0x82` 时，只需在配置文件中改为：
+
+```json
+"method": "0x82"
+```
+
+`0x80` 使用单字节质询和 `USERNAME + PASSWORD` 作为 HMAC-SHA256 密钥；`0x82` 使用 4 字节质询和 `USERNAME + MD5(PASSWORD)十六进制字符串` 作为密钥，并附加协议规定的 21 字节固定数据。
 
 Linux/macOS：
 
@@ -331,7 +339,7 @@ export CF_ZONE_ID="your_zone_id"
 
 **Q: 代理环境下能用吗？**
 
-默认模式仍然**强制直连**，忽略 `HTTP_PROXY/HTTPS_PROXY/NO_PROXY` 环境变量。只有显式设置 `--private-socks` 或 `MCIS_PRIVATE_SOCKS` 时，延迟探测和下载测速才会使用上述私有 SOCKS `0x80` 代理。
+默认模式仍然**强制直连**，忽略 `HTTP_PROXY/HTTPS_PROXY/NO_PROXY` 环境变量。只有显式设置 `--private-socks` 或 `MCIS_PRIVATE_SOCKS` 时，延迟探测和下载测速才会使用上述私有 SOCKS `0x80/0x82` 代理。
 
 ## 构建
 

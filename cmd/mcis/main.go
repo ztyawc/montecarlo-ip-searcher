@@ -173,7 +173,7 @@ func main() {
 	flag.StringVar(&privateSOCKSAddress, "private-socks", "", "Private SOCKS proxy address as host:port (optional)")
 	flag.StringVar(&privateSOCKSUsername, "private-socks-username", "", "Private SOCKS username (or MCIS_PRIVATE_SOCKS_USERNAME)")
 	flag.StringVar(&privateSOCKSPassword, "private-socks-password", "", "Private SOCKS password (prefer MCIS_PRIVATE_SOCKS_PASSWORD)")
-	flag.StringVar(&privateSOCKSMethod, "private-socks-method", "0x80", "Private SOCKS authentication method (currently only 0x80)")
+	flag.StringVar(&privateSOCKSMethod, "private-socks-method", "0x80", "Private SOCKS authentication method: 0x80 or 0x82")
 	flag.DurationVar(&privateSOCKSTimeout, "private-socks-timeout", 10*time.Second, "Private SOCKS TCP and handshake timeout")
 
 	// Colo filter (CDN node filter by trace colo)
@@ -257,7 +257,7 @@ func main() {
 			os.Exit(1)
 		}
 		if verbose {
-			fmt.Fprintf(os.Stderr, "proxy: private SOCKS enabled address=%s method=0x80\n", privateSOCKSAddress)
+			fmt.Fprintf(os.Stderr, "proxy: private SOCKS enabled address=%s method=0x%02x\n", privateSOCKSAddress, method)
 		}
 	}
 

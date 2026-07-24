@@ -37,6 +37,34 @@ func TestLoadConfigFile(t *testing.T) {
 	}
 }
 
+func TestParseMethod(t *testing.T) {
+	tests := []struct {
+		value   string
+		method  byte
+		wantErr bool
+	}{
+		{value: "0x80", method: Method80},
+		{value: "80", method: Method80},
+		{value: "0X82", method: Method82},
+		{value: "82", method: Method82},
+		{value: "0x81", wantErr: true},
+	}
+	for _, test := range tests {
+		t.Run(test.value, func(t *testing.T) {
+			method, err := ParseMethod(test.value)
+			if test.wantErr {
+				if err == nil {
+					t.Fatalf("unsupported method %q was accepted", test.value)
+				}
+				return
+			}
+			if err != nil || method != test.method {
+				t.Fatalf("ParseMethod(%q) = 0x%02x, %v; want 0x%02x", test.value, method, err, test.method)
+			}
+		})
+	}
+}
+
 func TestLoadConfigFileRejectsUnknownField(t *testing.T) {
 	path := writeTestConfig(t, `{"server":"127.0.0.1","port":10800,"pasword":"typo"}`)
 	if _, err := LoadConfigFile(path); err == nil {

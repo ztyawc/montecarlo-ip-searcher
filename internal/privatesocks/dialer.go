@@ -1,11 +1,13 @@
-// Package privatesocks implements the private SOCKS5 0x80 authentication
-// protocol used by some accelerator endpoints.
+// Package privatesocks implements the private SOCKS5 0x80 and 0x82
+// authentication protocols used by some accelerator endpoints.
 package privatesocks
 
 import (
 	"context"
 	"crypto/hmac"
+	"crypto/md5"
 	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -19,6 +21,8 @@ import (
 const (
 	// Method80 is the private single-byte challenge authentication method.
 	Method80 byte = 0x80
+	// Method82 is the private four-byte challenge authentication method.
+	Method82 byte = 0x82
 
 	usernameLength        = 19
 	authenticationVersion = 0x01
@@ -26,6 +30,12 @@ const (
 	commandConnect        = 0x01
 	defaultTimeout        = 10 * time.Second
 )
+
+var method82FixedData = [...]byte{
+	0x14, 0x01, 0x01, 0x01, 0x02, 0x04, 0x00,
+	0x00, 0x00, 0x00, 0x03, 0x02, 0x27, 0x10,
+	0x04, 0x01, 0x01, 0x05, 0x02, 0x00, 0x04,
+}
 
 // Config configures a private SOCKS5 dialer.
 type Config struct {
@@ -73,8 +83,8 @@ func (c Config) Validate() error {
 	if err != nil || port < 1 || port > 65535 {
 		return fmt.Errorf("invalid private SOCKS port %q", portText)
 	}
-	if c.Method != Method80 {
-		return fmt.Errorf("unsupported private SOCKS method 0x%02x: only 0x80 is supported", c.Method)
+	if c.Method != Method80 && c.Method != Method82 {
+		return fmt.Errorf("unsupported private SOCKS method 0x%02x: supported methods are 0x80 and 0x82", c.Method)
 	}
 	if len(c.Username) != usernameLength {
 		return fmt.Errorf("private SOCKS username must be exactly %d bytes", usernameLength)
@@ -125,15 +135,15 @@ func (d *Dialer) DialContext(ctx context.Context, network, address string) (net.
 		return nil, contextError(ctx, "send private SOCKS method", err)
 	}
 
-	var challengeResponse [2]byte
-	if _, err := io.ReadFull(conn, challengeResponse[:]); err != nil {
+	challenge, err := d.readAuthenticationChallenge(conn)
+	if err != nil {
 		return nil, contextError(ctx, "read private SOCKS challenge", err)
 	}
-	if challengeResponse[0] != socksVersion {
-		return nil, fmt.Errorf("invalid private SOCKS challenge version 0x%02x", challengeResponse[0])
-	}
 
-	authenticationRequest := d.buildAuthenticationRequest(challengeResponse[1])
+	authenticationRequest, err := d.buildAuthenticationRequest(challenge)
+	if err != nil {
+		return nil, err
+	}
 	if err := writeXOR(conn, authenticationRequest); err != nil {
 		return nil, contextError(ctx, "send private SOCKS authentication", err)
 	}
@@ -168,17 +178,65 @@ func (d *Dialer) DialContext(ctx context.Context, network, address string) (net.
 	return &clientXORConn{Conn: conn}, nil
 }
 
-func (d *Dialer) buildAuthenticationRequest(challenge byte) []byte {
-	mac := hmac.New(sha256.New, []byte(d.cfg.Username+d.cfg.Password))
-	_, _ = mac.Write([]byte{challenge})
+func (d *Dialer) readAuthenticationChallenge(reader io.Reader) ([]byte, error) {
+	switch d.cfg.Method {
+	case Method80:
+		var response [2]byte
+		if _, err := io.ReadFull(reader, response[:]); err != nil {
+			return nil, err
+		}
+		if response[0] != socksVersion {
+			return nil, fmt.Errorf("invalid private SOCKS challenge version 0x%02x", response[0])
+		}
+		return response[1:], nil
+	case Method82:
+		var response [6]byte
+		if _, err := io.ReadFull(reader, response[:]); err != nil {
+			return nil, err
+		}
+		if response[0] != socksVersion {
+			return nil, fmt.Errorf("invalid private SOCKS challenge version 0x%02x", response[0])
+		}
+		if response[1] != Method82 {
+			return nil, fmt.Errorf("private SOCKS method 0x82 rejected: selected method=0x%02x", response[1])
+		}
+		return response[2:], nil
+	default:
+		return nil, fmt.Errorf("unsupported private SOCKS method 0x%02x", d.cfg.Method)
+	}
+}
+
+func (d *Dialer) buildAuthenticationRequest(challenge []byte) ([]byte, error) {
+	var key string
+	var fixedData []byte
+	switch d.cfg.Method {
+	case Method80:
+		if len(challenge) != 1 {
+			return nil, fmt.Errorf("private SOCKS method 0x80 challenge must be 1 byte, got %d", len(challenge))
+		}
+		key = d.cfg.Username + d.cfg.Password
+	case Method82:
+		if len(challenge) != 4 {
+			return nil, fmt.Errorf("private SOCKS method 0x82 challenge must be 4 bytes, got %d", len(challenge))
+		}
+		passwordDigest := md5.Sum([]byte(d.cfg.Password))
+		key = d.cfg.Username + hex.EncodeToString(passwordDigest[:])
+		fixedData = method82FixedData[:]
+	default:
+		return nil, fmt.Errorf("unsupported private SOCKS method 0x%02x", d.cfg.Method)
+	}
+
+	mac := hmac.New(sha256.New, []byte(key))
+	_, _ = mac.Write(challenge)
 	signature := mac.Sum(nil)
 
-	request := make([]byte, 0, 2+len(d.cfg.Username)+1+len(signature))
+	request := make([]byte, 0, 2+len(d.cfg.Username)+1+len(signature)+len(fixedData))
 	request = append(request, authenticationVersion, byte(len(d.cfg.Username)))
 	request = append(request, d.cfg.Username...)
 	request = append(request, byte(len(signature)))
 	request = append(request, signature...)
-	return request
+	request = append(request, fixedData...)
+	return request, nil
 }
 
 func buildConnectRequest(address string) ([]byte, error) {

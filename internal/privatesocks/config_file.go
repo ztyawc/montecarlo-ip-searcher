@@ -94,8 +94,10 @@ func ParseMethod(value string) (byte, error) {
 	switch strings.ToLower(strings.TrimSpace(value)) {
 	case "0x80", "80":
 		return Method80, nil
+	case "0x82", "82":
+		return Method82, nil
 	default:
-		return 0, fmt.Errorf("unsupported private SOCKS method %q: only 0x80 is supported", value)
+		return 0, fmt.Errorf("unsupported private SOCKS method %q: supported methods are 0x80 and 0x82", value)
 	}
 }
 

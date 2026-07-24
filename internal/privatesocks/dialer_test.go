@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"context"
 	"crypto/hmac"
+	"crypto/md5"
 	"crypto/sha256"
 	"crypto/tls"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"net"
@@ -20,6 +22,15 @@ const (
 )
 
 func TestDialContextMethod80(t *testing.T) {
+	testDialContext(t, Method80)
+}
+
+func TestDialContextMethod82(t *testing.T) {
+	testDialContext(t, Method82)
+}
+
+func testDialContext(t *testing.T, method byte) {
+	t.Helper()
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -30,14 +41,14 @@ func TestDialContextMethod80(t *testing.T) {
 
 	serverDone := make(chan error, 1)
 	go func() {
-		serverDone <- runFakeServer(listener)
+		serverDone <- runFakeServer(listener, method)
 	}()
 
 	dialer, err := New(Config{
 		Address:          listener.Addr().String(),
 		Username:         testUsername,
 		Password:         testPassword,
-		Method:           Method80,
+		Method:           method,
 		HandshakeTimeout: 5 * time.Second,
 	})
 	if err != nil {
@@ -123,12 +134,16 @@ func TestConfigValidation(t *testing.T) {
 	if err := valid.Validate(); err != nil {
 		t.Fatalf("valid configuration rejected: %v", err)
 	}
+	valid.Method = Method82
+	if err := valid.Validate(); err != nil {
+		t.Fatalf("valid method 0x82 configuration rejected: %v", err)
+	}
 
 	tests := []Config{
 		{Address: "127.0.0.1", Username: testUsername, Password: testPassword, Method: Method80},
 		{Address: "127.0.0.1:10800", Username: "short", Password: testPassword, Method: Method80},
 		{Address: "127.0.0.1:10800", Username: testUsername, Method: Method80},
-		{Address: "127.0.0.1:10800", Username: testUsername, Password: testPassword, Method: 0x82},
+		{Address: "127.0.0.1:10800", Username: testUsername, Password: testPassword, Method: 0x81},
 	}
 	for index, test := range tests {
 		if err := test.Validate(); err == nil {
@@ -142,11 +157,20 @@ func TestLiveDialContext(t *testing.T) {
 		t.Skip("set MCIS_PRIVATE_SOCKS_LIVE=1 to run against a real endpoint")
 	}
 
+	method := Method80
+	if methodValue := os.Getenv("MCIS_PRIVATE_SOCKS_METHOD"); methodValue != "" {
+		var err error
+		method, err = ParseMethod(methodValue)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+
 	dialer, err := New(Config{
 		Address:          os.Getenv("MCIS_PRIVATE_SOCKS"),
 		Username:         os.Getenv("MCIS_PRIVATE_SOCKS_USERNAME"),
 		Password:         os.Getenv("MCIS_PRIVATE_SOCKS_PASSWORD"),
-		Method:           Method80,
+		Method:           method,
 		HandshakeTimeout: 10 * time.Second,
 	})
 	if err != nil {
@@ -181,7 +205,7 @@ func TestLiveDialContext(t *testing.T) {
 	}
 }
 
-func runFakeServer(listener net.Listener) error {
+func runFakeServer(listener net.Listener, method byte) error {
 	conn, err := listener.Accept()
 	if err != nil {
 		return err
@@ -195,16 +219,30 @@ func runFakeServer(listener net.Listener) error {
 	if err != nil {
 		return err
 	}
-	if !bytes.Equal(methodRequest, []byte{0x05, 0x01, Method80}) {
+	if !bytes.Equal(methodRequest, []byte{0x05, 0x01, method}) {
 		return fmt.Errorf("unexpected method request %x", methodRequest)
 	}
 
-	const challenge = 0x7A
-	if _, err := writeFull(conn, []byte{0x05, challenge}); err != nil {
+	var challenge []byte
+	var challengeResponse []byte
+	var authenticationLength int
+	switch method {
+	case Method80:
+		challenge = []byte{0x7A}
+		challengeResponse = []byte{0x05, challenge[0]}
+		authenticationLength = 54
+	case Method82:
+		challenge = []byte{0x12, 0x34, 0x56, 0x78}
+		challengeResponse = append([]byte{0x05, Method82}, challenge...)
+		authenticationLength = 75
+	default:
+		return fmt.Errorf("unsupported test method 0x%02x", method)
+	}
+	if _, err := writeFull(conn, challengeResponse); err != nil {
 		return err
 	}
 
-	authenticationRequest, err := readXOR(conn, 54)
+	authenticationRequest, err := readXOR(conn, authenticationLength)
 	if err != nil {
 		return err
 	}
@@ -214,10 +252,18 @@ func runFakeServer(listener net.Listener) error {
 		authenticationRequest[21] != 32 {
 		return fmt.Errorf("invalid authentication packet %x", authenticationRequest[:22])
 	}
-	mac := hmac.New(sha256.New, []byte(testUsername+testPassword))
-	_, _ = mac.Write([]byte{challenge})
-	if !hmac.Equal(authenticationRequest[22:], mac.Sum(nil)) {
+	key := testUsername + testPassword
+	if method == Method82 {
+		passwordDigest := md5.Sum([]byte(testPassword))
+		key = testUsername + hex.EncodeToString(passwordDigest[:])
+	}
+	mac := hmac.New(sha256.New, []byte(key))
+	_, _ = mac.Write(challenge)
+	if !hmac.Equal(authenticationRequest[22:54], mac.Sum(nil)) {
 		return fmt.Errorf("invalid authentication signature")
+	}
+	if method == Method82 && !bytes.Equal(authenticationRequest[54:], method82FixedData[:]) {
+		return fmt.Errorf("invalid method 0x82 fixed data %x", authenticationRequest[54:])
 	}
 
 	if _, err := writeFull(conn, []byte{0x01, 0x00}); err != nil {
