@@ -1,0 +1,8 @@
+/.gradle/
+/build/
+/.signing/
+/local.properties
+/app/build/
+/app/src/main/jniLibs/**/libmcis.so
+/app/src/main/assets/ipv4cidr.txt
+/app/src/main/assets/ipv6cidr.txt

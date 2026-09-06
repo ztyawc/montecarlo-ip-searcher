@@ -4,6 +4,7 @@ package engine
 
 import (
 	"fmt"
+	"math"
 	"time"
 
 	"github.com/Leo-Mu/montecarlo-ip-searcher/internal/bandit"
@@ -24,7 +25,7 @@ type Config struct {
 	// Heads is the number of search heads for diversity.
 	Heads int
 
-	// Beam is the width of the beam search per head.
+	// Beam bounds the retained candidates scored for each head's selection.
 	Beam int
 
 	// SplitStepV4 is the prefix bits to add when splitting IPv4.
@@ -119,61 +120,22 @@ func (c *Config) Validate() error {
 	if c.MinSamplesSplit <= 0 {
 		return fmt.Errorf("minSamplesSplit must be > 0, got %d", c.MinSamplesSplit)
 	}
+	if c.SplitInterval <= 0 {
+		return fmt.Errorf("splitInterval must be > 0, got %d", c.SplitInterval)
+	}
 	if c.MaxBitsV4 <= 0 || c.MaxBitsV4 > 32 {
 		return fmt.Errorf("maxBitsV4 must be in [1,32], got %d", c.MaxBitsV4)
 	}
 	if c.MaxBitsV6 <= 0 || c.MaxBitsV6 > 128 {
 		return fmt.Errorf("maxBitsV6 must be in [1,128], got %d", c.MaxBitsV6)
 	}
-	if c.DiversityWeight < 0 || c.DiversityWeight > 1 {
+	if math.IsNaN(c.DiversityWeight) || math.IsInf(c.DiversityWeight, 0) || c.DiversityWeight < 0 || c.DiversityWeight > 1 {
 		return fmt.Errorf("diversityWeight must be in [0,1], got %f", c.DiversityWeight)
 	}
 	if len(c.ColoAllow) > 0 && len(c.ColoBlock) > 0 {
 		return fmt.Errorf("cannot use both colo allow and colo exclude; use only one")
 	}
 	return nil
-}
-
-// ApplyDefaults fills in zero values with defaults.
-func (c *Config) ApplyDefaults() {
-	defaults := DefaultConfig()
-
-	if c.Budget <= 0 {
-		c.Budget = defaults.Budget
-	}
-	if c.TopN <= 0 {
-		c.TopN = defaults.TopN
-	}
-	if c.Concurrency <= 0 {
-		c.Concurrency = defaults.Concurrency
-	}
-	if c.Heads <= 0 {
-		c.Heads = defaults.Heads
-	}
-	if c.Beam <= 0 {
-		c.Beam = defaults.Beam
-	}
-	if c.SplitStepV4 <= 0 {
-		c.SplitStepV4 = defaults.SplitStepV4
-	}
-	if c.SplitStepV6 <= 0 {
-		c.SplitStepV6 = defaults.SplitStepV6
-	}
-	if c.MinSamplesSplit <= 0 {
-		c.MinSamplesSplit = defaults.MinSamplesSplit
-	}
-	if c.MaxBitsV4 <= 0 {
-		c.MaxBitsV4 = defaults.MaxBitsV4
-	}
-	if c.MaxBitsV6 <= 0 {
-		c.MaxBitsV6 = defaults.MaxBitsV6
-	}
-	if c.SplitInterval <= 0 {
-		c.SplitInterval = defaults.SplitInterval
-	}
-	if c.DiversityWeight <= 0 {
-		c.DiversityWeight = defaults.DiversityWeight
-	}
 }
 
 // ToTreeConfig converts to bandit.TreeConfig.
@@ -193,7 +155,7 @@ func (c *Config) ToHeadManagerConfig(timeoutMS float64) bandit.HeadManagerConfig
 		NumHeads:        c.Heads,
 		TimeoutMS:       timeoutMS,
 		BaseSeed:        c.Seed,
-		HistorySize:     c.Beam,
+		HistorySize:     32,
 		DiversityWeight: c.DiversityWeight,
 		RepulsionDecay:  0.5,
 	}
@@ -204,5 +166,5 @@ func (r *Request) TimeoutMS() float64 {
 	if r.Probe.Timeout <= 0 {
 		return 3000
 	}
-	return float64(r.Probe.Timeout / time.Millisecond)
+	return float64(r.Probe.Timeout) / float64(time.Millisecond)
 }

@@ -1,0 +1,82 @@
+plugins {
+    id 'com.android.application'
+}
+
+def mcisRepositoryRoot = rootProject.projectDir.parentFile
+def mcisNativeOutput = layout.projectDirectory.file('src/main/jniLibs/arm64-v8a/libmcis.so')
+def mcisAssetsOutput = layout.projectDirectory.dir('src/main/assets')
+def goExecutable = providers.gradleProperty('goExecutable').orElse('go')
+
+android {
+    namespace 'com.ztyawc.mcis'
+    compileSdk 35
+
+    defaultConfig {
+        applicationId 'com.ztyawc.mcis'
+        minSdk 26
+        targetSdk 35
+        versionCode 3
+        versionName '0.3.1-android.3'
+
+        ndk {
+            abiFilters 'arm64-v8a'
+        }
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+        }
+    }
+
+    packaging {
+        jniLibs {
+            useLegacyPackaging = true
+            keepDebugSymbols += ['**/libmcis.so']
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+}
+
+tasks.register('buildMcisNative', Exec) {
+    group = 'build'
+    description = 'Cross-compiles the MCIS Go CLI as the Android arm64 native core.'
+    workingDir mcisRepositoryRoot
+    environment 'CGO_ENABLED', '0'
+    environment 'GOOS', 'android'
+    environment 'GOARCH', 'arm64'
+
+    inputs.files(fileTree(mcisRepositoryRoot) {
+        include 'cmd/**/*.go'
+        include 'internal/**/*.go'
+        include 'go.mod'
+        include 'go.sum'
+    })
+    outputs.file(mcisNativeOutput)
+
+    doFirst {
+        mcisNativeOutput.asFile.parentFile.mkdirs()
+        commandLine goExecutable.get(), 'build', '-trimpath', '-ldflags=-s -w',
+                '-o', mcisNativeOutput.asFile.absolutePath, './cmd/mcis'
+    }
+}
+
+tasks.register('syncMcisCidrAssets', Copy) {
+    group = 'build'
+    description = 'Copies the canonical CIDR lists into the Android assets directory.'
+    from(mcisRepositoryRoot) {
+        include 'ipv4cidr.txt'
+        include 'ipv6cidr.txt'
+    }
+    into mcisAssetsOutput
+}
+
+tasks.named('preBuild').configure {
+    dependsOn tasks.named('buildMcisNative')
+    dependsOn tasks.named('syncMcisCidrAssets')
+}

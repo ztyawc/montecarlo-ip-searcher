@@ -223,6 +223,13 @@ func (s *ThompsonSampler) SampleUniform() float64 {
 	return s.rng.Float64()
 }
 
+// SampleIndex returns a uniform index in [0, n). The caller supplies n > 0.
+func (s *ThompsonSampler) SampleIndex(n int) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.rng.Intn(n)
+}
+
 // sampleAddrFromPrefix generates a random address within a prefix.
 func sampleAddrFromPrefix(p netip.Prefix, rng *rand.Rand) netip.Addr {
 	p = p.Masked()

@@ -1,301 +1,232 @@
 package dns
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
-	"net/netip"
+	"net/url"
+	"strconv"
+	"strings"
 )
 
 const cloudflareAPIBase = "https://api.cloudflare.com/client/v4"
 
-// CloudflareProvider implements Provider for Cloudflare DNS.
 type CloudflareProvider struct {
 	token    string
 	zoneID   string
-	zoneName string // cached zone name (e.g., "example.com")
+	zoneName string
 	client   *http.Client
 }
 
-// NewCloudflareProvider creates a new Cloudflare DNS provider.
 func NewCloudflareProvider(token, zoneID string) *CloudflareProvider {
-	return &CloudflareProvider{
-		token:  token,
-		zoneID: zoneID,
-		client: &http.Client{},
-	}
+	return &CloudflareProvider{token: token, zoneID: zoneID, client: newHTTPClient()}
 }
 
-func (p *CloudflareProvider) Name() string {
-	return "cloudflare"
-}
+func (p *CloudflareProvider) Name() string { return "cloudflare" }
 
-// cfDNSRecord represents a Cloudflare DNS record.
 type cfDNSRecord struct {
-	ID      string `json:"id"`
-	Type    string `json:"type"`
-	Name    string `json:"name"`
-	Content string `json:"content"`
-	TTL     int    `json:"ttl"`
-	Proxied bool   `json:"proxied"`
+	Record
+	Name string `json:"name"`
 }
 
-// cfListResponse represents the Cloudflare API list response.
-type cfListResponse struct {
-	Success bool          `json:"success"`
-	Errors  []cfError     `json:"errors"`
-	Result  []cfDNSRecord `json:"result"`
+type cfResponse struct {
+	Success bool `json:"success"`
+	Errors  []struct {
+		Message string `json:"message"`
+	} `json:"errors"`
+	Result     json.RawMessage `json:"result"`
+	ResultInfo *struct {
+		Page       int  `json:"page"`
+		PerPage    int  `json:"per_page"`
+		TotalCount *int `json:"total_count"`
+		TotalPages int  `json:"total_pages"`
+	} `json:"result_info"`
 }
 
-// cfCreateResponse represents the Cloudflare API create response.
-type cfCreateResponse struct {
-	Success bool        `json:"success"`
-	Errors  []cfError   `json:"errors"`
-	Result  cfDNSRecord `json:"result"`
+func (p *CloudflareProvider) request(ctx context.Context, method, path string, payload any) (cfResponse, error) {
+	var result cfResponse
+	if err := requestJSON(ctx, p.client, method, cloudflareAPIBase+path, p.token, payload, &result); err != nil {
+		return result, err
+	}
+	if !result.Success || len(result.Errors) > 0 {
+		if len(result.Errors) > 0 {
+			return result, fmt.Errorf("cloudflare API error: %s", result.Errors[0].Message)
+		}
+		return result, fmt.Errorf("cloudflare API did not confirm success")
+	}
+	return result, nil
 }
 
-// cfDeleteResponse represents the Cloudflare API delete response.
-type cfDeleteResponse struct {
-	Success bool      `json:"success"`
-	Errors  []cfError `json:"errors"`
+func (p *CloudflareProvider) recordsPath() string {
+	return "/zones/" + url.PathEscape(p.zoneID) + "/dns_records"
 }
 
-type cfError struct {
-	Code    int    `json:"code"`
-	Message string `json:"message"`
-}
-
-// cfZoneResponse represents the Cloudflare API zone response.
-type cfZoneResponse struct {
-	Success bool      `json:"success"`
-	Errors  []cfError `json:"errors"`
-	Result  struct {
-		Name string `json:"name"`
-	} `json:"result"`
-}
-
-// getZoneName fetches and caches the zone name (domain).
-func (p *CloudflareProvider) getZoneName(ctx context.Context) (string, error) {
-	if p.zoneName != "" {
+func (p *CloudflareProvider) buildFQDN(ctx context.Context, subdomain string) (string, error) {
+	name, err := normalizeSubdomain(subdomain)
+	if err != nil {
+		return "", err
+	}
+	if p.zoneName == "" {
+		response, err := p.request(ctx, http.MethodGet, "/zones/"+url.PathEscape(p.zoneID), nil)
+		if err != nil {
+			return "", err
+		}
+		var zone struct {
+			Name string `json:"name"`
+		}
+		if err := json.Unmarshal(response.Result, &zone); err != nil {
+			return "", fmt.Errorf("invalid Cloudflare zone response: %w", err)
+		}
+		zoneName, err := normalizeDomain(zone.Name)
+		if err != nil {
+			return "", fmt.Errorf("invalid Cloudflare zone name: %w", err)
+		}
+		p.zoneName = zoneName
+	}
+	if name == "" {
 		return p.zoneName, nil
 	}
-
-	url := fmt.Sprintf("%s/zones/%s", cloudflareAPIBase, p.zoneID)
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-	if err != nil {
+	name += "." + p.zoneName
+	if err := validateDNSName(name, true); err != nil {
 		return "", err
 	}
-	req.Header.Set("Authorization", "Bearer "+p.token)
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := p.client.Do(req)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return "", err
-	}
-
-	var result cfZoneResponse
-	if err := json.Unmarshal(body, &result); err != nil {
-		return "", fmt.Errorf("parse response: %w", err)
-	}
-
-	if !result.Success {
-		if len(result.Errors) > 0 {
-			return "", fmt.Errorf("cloudflare API error: %s", result.Errors[0].Message)
-		}
-		return "", fmt.Errorf("cloudflare API error: unknown")
-	}
-
-	p.zoneName = result.Result.Name
-	return p.zoneName, nil
+	return name, nil
 }
 
-// buildFQDN builds the full domain name from subdomain.
-func (p *CloudflareProvider) buildFQDN(ctx context.Context, subdomain string) (string, error) {
-	zoneName, err := p.getZoneName(ctx)
-	if err != nil {
-		return "", fmt.Errorf("get zone name: %w", err)
-	}
-	if subdomain == "" || subdomain == "@" {
-		return zoneName, nil
-	}
-	return subdomain + "." + zoneName, nil
-}
-
-// DeleteRecords deletes all A or AAAA records for the subdomain.
-func (p *CloudflareProvider) DeleteRecords(ctx context.Context, subdomain string, ipv6 bool) error {
-	recordType := "A"
-	if ipv6 {
-		recordType = "AAAA"
-	}
-
-	// Build full domain name
+// ListRecords uses numbered pagination and filters the returned records again,
+// so an unexpected API filter result cannot widen the scope of a later delete.
+func (p *CloudflareProvider) ListRecords(ctx context.Context, subdomain string) ([]Record, error) {
 	fqdn, err := p.buildFQDN(ctx, subdomain)
 	if err != nil {
-		return err
+		return nil, err
 	}
-
-	// List existing records
-	records, err := p.listRecords(ctx, fqdn, recordType)
-	if err != nil {
-		return err
-	}
-
-	// Delete each record
-	for _, rec := range records {
-		if err := p.deleteRecord(ctx, rec.ID); err != nil {
-			return fmt.Errorf("delete record %s: %w", rec.ID, err)
+	var records []Record
+	seen := make(map[string]cfDNSRecord)
+	var totalCount *int
+	finish := func() ([]Record, error) {
+		if totalCount != nil && len(seen) != *totalCount {
+			return nil, fmt.Errorf("Cloudflare pagination returned %d of %d records", len(seen), *totalCount)
 		}
+		return checkedRecords(records)
 	}
-	return nil
+	for page := 1; page <= maxDNSPages; page++ {
+		query := url.Values{
+			"name.exact": {fqdn}, "match": {"all"},
+			"page": {strconv.Itoa(page)}, "per_page": {strconv.Itoa(dnsPageSize)},
+		}
+		response, err := p.request(ctx, http.MethodGet, p.recordsPath()+"?"+query.Encode(), nil)
+		if err != nil {
+			return nil, err
+		}
+		var rows []cfDNSRecord
+		if err := json.Unmarshal(response.Result, &rows); err != nil || rows == nil {
+			return nil, fmt.Errorf("invalid Cloudflare record list")
+		}
+		info := response.ResultInfo
+		if info != nil && ((info.Page != 0 && info.Page != page) || info.TotalPages < 0 || info.PerPage < 0 || (info.PerPage > 0 && len(rows) > info.PerPage) || (info.TotalPages > 0 && page > info.TotalPages)) {
+			return nil, fmt.Errorf("invalid Cloudflare pagination on page %d", page)
+		}
+		if info != nil && info.TotalCount != nil {
+			if *info.TotalCount < 0 || (totalCount != nil && *totalCount != *info.TotalCount) {
+				return nil, fmt.Errorf("Cloudflare record count changed during pagination")
+			}
+			totalCount = info.TotalCount
+		}
+		if len(rows) == 0 {
+			if info != nil && info.TotalPages > page {
+				return nil, fmt.Errorf("Cloudflare pagination ended before its last page")
+			}
+			return finish()
+		}
+		newIDs := 0
+		for _, r := range rows {
+			if r.ID == "" || r.Name == "" || r.Type == "" {
+				return nil, fmt.Errorf("incomplete Cloudflare DNS record")
+			}
+			if previous, ok := seen[r.ID]; ok {
+				if previous.Name != r.Name || !sameRecord(previous.Record, r.Record) {
+					return nil, fmt.Errorf("Cloudflare record %s changed during pagination", r.ID)
+				}
+				continue
+			}
+			seen[r.ID] = r
+			newIDs++
+			if strings.EqualFold(strings.TrimSuffix(r.Name, "."), fqdn) && (r.Type == "A" || r.Type == "AAAA") {
+				records = append(records, r.Record)
+			}
+		}
+		if newIDs == 0 {
+			return nil, fmt.Errorf("Cloudflare pagination did not advance")
+		}
+		if totalCount != nil && len(seen) > *totalCount {
+			return nil, fmt.Errorf("Cloudflare pagination exceeded its declared record count")
+		}
+		if info != nil && info.TotalPages > 0 && page == info.TotalPages {
+			return finish()
+		}
+		// Without total_pages, request the next page until an empty page proves
+		// completion; never assume the API used our requested page size.
+	}
+	return nil, fmt.Errorf("Cloudflare pagination exceeded %d pages", maxDNSPages)
 }
 
-// CreateRecords creates A/AAAA records for the given IPs.
-func (p *CloudflareProvider) CreateRecords(ctx context.Context, subdomain string, ips []netip.Addr) error {
-	// Build full domain name
+func (p *CloudflareProvider) CreateRecord(ctx context.Context, subdomain string, record Record) (Record, error) {
+	if _, err := recordKey(record); err != nil {
+		return Record{}, err
+	}
 	fqdn, err := p.buildFQDN(ctx, subdomain)
 	if err != nil {
-		return err
+		return Record{}, err
 	}
-
-	for _, ip := range ips {
-		recordType := "A"
-		if ip.Is6() {
-			recordType = "AAAA"
-		}
-		if err := p.createRecord(ctx, fqdn, recordType, ip.String()); err != nil {
-			return fmt.Errorf("create record for %s: %w", ip.String(), err)
-		}
+	if record.TTL == 0 {
+		record.TTL = 1
 	}
-	return nil
+	payload := map[string]any{
+		"name": fqdn, "type": record.Type, "content": record.Content,
+		"ttl": record.TTL, "proxied": record.Proxied,
+	}
+	if record.Comment != "" {
+		payload["comment"] = record.Comment
+	}
+	if len(record.Tags) > 0 {
+		payload["tags"] = record.Tags
+	}
+	if len(record.Settings) > 0 {
+		payload["settings"] = record.Settings
+	}
+	if record.PrivateRouting {
+		payload["private_routing"] = true
+	}
+	response, err := p.request(ctx, http.MethodPost, p.recordsPath(), payload)
+	if err != nil {
+		return Record{}, err
+	}
+	var created cfDNSRecord
+	if err := json.Unmarshal(response.Result, &created); err != nil {
+		return Record{}, fmt.Errorf("invalid Cloudflare creation response: %w", err)
+	}
+	want, _ := recordKey(record)
+	got, err := recordKey(created.Record)
+	if err != nil || created.ID == "" || got != want || !strings.EqualFold(strings.TrimSuffix(created.Name, "."), fqdn) {
+		return Record{}, fmt.Errorf("Cloudflare creation response did not identify the requested record")
+	}
+	return created.Record, nil
 }
 
-func (p *CloudflareProvider) listRecords(ctx context.Context, name, recordType string) ([]cfDNSRecord, error) {
-	url := fmt.Sprintf("%s/zones/%s/dns_records?type=%s&name=%s", cloudflareAPIBase, p.zoneID, recordType, name)
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-	if err != nil {
-		return nil, err
+func (p *CloudflareProvider) DeleteRecord(ctx context.Context, recordID string) error {
+	if recordID == "" {
+		return fmt.Errorf("Cloudflare record ID must not be empty")
 	}
-	req.Header.Set("Authorization", "Bearer "+p.token)
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := p.client.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, err
-	}
-
-	var result cfListResponse
-	if err := json.Unmarshal(body, &result); err != nil {
-		return nil, fmt.Errorf("parse response: %w", err)
-	}
-
-	if !result.Success {
-		if len(result.Errors) > 0 {
-			return nil, fmt.Errorf("cloudflare API error: %s", result.Errors[0].Message)
-		}
-		return nil, fmt.Errorf("cloudflare API error: unknown")
-	}
-
-	return result.Result, nil
-}
-
-func (p *CloudflareProvider) deleteRecord(ctx context.Context, recordID string) error {
-	url := fmt.Sprintf("%s/zones/%s/dns_records/%s", cloudflareAPIBase, p.zoneID, recordID)
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, url, nil)
+	response, err := p.request(ctx, http.MethodDelete, p.recordsPath()+"/"+url.PathEscape(recordID), nil)
 	if err != nil {
 		return err
 	}
-	req.Header.Set("Authorization", "Bearer "+p.token)
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := p.client.Do(req)
-	if err != nil {
-		return err
+	var deleted struct {
+		ID string `json:"id"`
 	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return err
+	if err := json.Unmarshal(response.Result, &deleted); err != nil || deleted.ID != recordID {
+		return fmt.Errorf("Cloudflare deletion response did not identify record %s", recordID)
 	}
-
-	var result cfDeleteResponse
-	if err := json.Unmarshal(body, &result); err != nil {
-		return fmt.Errorf("parse response: %w", err)
-	}
-
-	if !result.Success {
-		if len(result.Errors) > 0 {
-			return fmt.Errorf("cloudflare API error: %s", result.Errors[0].Message)
-		}
-		return fmt.Errorf("cloudflare API error: unknown")
-	}
-
-	return nil
-}
-
-func (p *CloudflareProvider) createRecord(ctx context.Context, name, recordType, content string) error {
-	url := fmt.Sprintf("%s/zones/%s/dns_records", cloudflareAPIBase, p.zoneID)
-
-	payload := map[string]interface{}{
-		"type":    recordType,
-		"name":    name,
-		"content": content,
-		"ttl":     1, // Auto TTL
-		"proxied": false,
-	}
-
-	data, err := json.Marshal(payload)
-	if err != nil {
-		return err
-	}
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(data))
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Authorization", "Bearer "+p.token)
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := p.client.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return err
-	}
-
-	var result cfCreateResponse
-	if err := json.Unmarshal(body, &result); err != nil {
-		return fmt.Errorf("parse response: %w", err)
-	}
-
-	if !result.Success {
-		if len(result.Errors) > 0 {
-			return fmt.Errorf("cloudflare API error: %s", result.Errors[0].Message)
-		}
-		return fmt.Errorf("cloudflare API error: unknown")
-	}
-
 	return nil
 }

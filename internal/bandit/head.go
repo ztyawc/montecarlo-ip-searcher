@@ -3,6 +3,7 @@ package bandit
 import (
 	"math"
 	"net/netip"
+	"sort"
 	"sync"
 )
 
@@ -18,12 +19,23 @@ type SearchHead struct {
 	// History of explored prefixes (for diversity computation)
 	History     []netip.Prefix
 	historySize int
+	historyNext int
+
+	// Selection state is separate from the focus lock, so heads may inspect each
+	// other's focus without acquiring each other's candidate locks.
+	selectionMu  sync.Mutex
+	beamTree     *ArmTree
+	beamWidth    int
+	candidates   []scoredCandidate
+	candidateSet map[*ArmNode]struct{}
+	walk         leafWalk
 
 	mu sync.RWMutex
 }
 
 // NewSearchHead creates a new search head.
 func NewSearchHead(id int, seed int64, timeoutMS float64, historySize int) *SearchHead {
+	historySize = max(historySize, 0)
 	return &SearchHead{
 		ID:          id,
 		Sampler:     NewThompsonSampler(seed, timeoutMS),
@@ -38,11 +50,14 @@ func (h *SearchHead) SetFocus(prefix netip.Prefix) {
 	defer h.mu.Unlock()
 
 	h.CurrentFocus = prefix
-	h.History = append(h.History, prefix)
-
-	// Keep only recent history
-	if len(h.History) > h.historySize {
-		h.History = h.History[len(h.History)-h.historySize:]
+	if h.historySize == 0 {
+		return
+	}
+	if len(h.History) < h.historySize {
+		h.History = append(h.History, prefix)
+	} else {
+		h.History[h.historyNext] = prefix
+		h.historyNext = (h.historyNext + 1) % h.historySize
 	}
 }
 
@@ -58,7 +73,12 @@ func (h *SearchHead) GetHistory() []netip.Prefix {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
 	result := make([]netip.Prefix, len(h.History))
-	copy(result, h.History)
+	if len(h.History) < h.historySize || h.historyNext == 0 {
+		copy(result, h.History)
+	} else {
+		n := copy(result, h.History[h.historyNext:])
+		copy(result[n:], h.History[:h.historyNext])
+	}
 	return result
 }
 
@@ -123,143 +143,125 @@ func (m *HeadManager) GetHead(idx int) *SearchHead {
 	return m.heads[idx]
 }
 
-// SelectNextPrefix selects the next prefix for a head to explore,
-// considering both Thompson Sampling scores and diversity penalties.
-// It also gives a bonus to finer prefixes (children of good parents).
-func (m *HeadManager) SelectNextPrefix(head *SearchHead, tree *ArmTree, beamWidth int) netip.Prefix {
-	candidates := tree.LeafNodes()
-	if len(candidates) == 0 {
-		return netip.Prefix{}
-	}
-
-	// Get what other heads are currently exploring
-	otherFocuses := m.getOtherHeadFocuses(head.ID)
-
-	// Score each candidate with diversity penalty
-	type scoredCandidate struct {
-		node     *ArmNode
-		combined float64
-	}
-
-	scored := make([]scoredCandidate, len(candidates))
-	for i, node := range candidates {
-		// Thompson Sampling score (lower is better)
-		tsScore := head.Sampler.SampleScore(node)
-
-		// Diversity penalty (repulsion from other heads)
-		penalty := m.computeDiversityPenalty(node.Prefix, otherFocuses)
-
-		// Depth bonus: prefer drilling into finer prefixes
-		// This encourages exploitation of promising sub-regions
-		depthBonus := 0.0
-		bits := node.Prefix.Bits()
-		if node.Prefix.Addr().Is4() {
-			// For IPv4: /24 is max, /16 is starting point
-			// Give up to 20% bonus for finer prefixes
-			depthBonus = float64(bits-16) / 8.0 * 0.2
-		} else {
-			// For IPv6: /56 is max, /32 is typical starting point
-			depthBonus = float64(bits-32) / 24.0 * 0.2
-		}
-		if depthBonus < 0 {
-			depthBonus = 0
-		}
-
-		// Combined score (lower is better)
-		// Apply diversity penalty and depth bonus
-		combined := tsScore * (1 + m.diversityWeight*penalty) * (1 - depthBonus)
-
-		scored[i] = scoredCandidate{
-			node:     node,
-			combined: combined,
-		}
-	}
-
-	// Find the best candidate
-	best := scored[0]
-	for _, s := range scored[1:] {
-		if s.combined < best.combined {
-			best = s
-		}
-	}
-
-	// Update head's focus
-	head.SetFocus(best.node.Prefix)
-
-	return best.node.Prefix
+type scoredCandidate struct {
+	node  *ArmNode
+	score float64
 }
 
-// SelectBeam selects a beam of prefixes for a head to explore.
-func (m *HeadManager) SelectBeam(head *SearchHead, tree *ArmTree, beamWidth int) []netip.Prefix {
-	candidates := tree.LeafNodes()
-	if len(candidates) == 0 {
-		return nil
+// SelectNextPrefix scores at most beamWidth retained candidates. One slot is
+// refreshed on each subsequent selection, keeping global exploration alive.
+func (m *HeadManager) SelectNextPrefix(head *SearchHead, tree *ArmTree, beamWidth int) netip.Prefix {
+	return m.SelectNextAvailablePrefix(head, tree, beamWidth, nil)
+}
+
+// SelectNextAvailablePrefix also removes exhausted or split cached candidates.
+func (m *HeadManager) SelectNextAvailablePrefix(head *SearchHead, tree *ArmTree, beamWidth int, available func(netip.Prefix) bool) netip.Prefix {
+	if head == nil || tree == nil || beamWidth <= 0 {
+		return netip.Prefix{}
 	}
+	head.selectionMu.Lock()
+	defer head.selectionMu.Unlock()
+	m.prepareCandidates(head, tree, beamWidth, available)
+	return m.scoreCandidates(head)
+}
 
-	otherFocuses := m.getOtherHeadFocuses(head.ID)
-
-	// Score all candidates
-	type scoredCandidate struct {
-		prefix   netip.Prefix
-		combined float64
+// prepareCandidates keeps good candidates while rotating in one fresh leaf.
+// Its steady-state work is bounded by the beam, not the total tree size.
+// The caller owns head.selectionMu.
+func (m *HeadManager) prepareCandidates(head *SearchHead, tree *ArmTree, beamWidth int, available func(netip.Prefix) bool) {
+	target := min(beamWidth, tree.LeafCount())
+	if head.beamTree != tree || head.beamWidth != beamWidth {
+		head.beamTree, head.beamWidth = tree, beamWidth
+		head.candidates = make([]scoredCandidate, 0, target)
+		head.candidateSet = make(map[*ArmNode]struct{}, target)
+		head.walk = leafWalk{}
 	}
-
-	scored := make([]scoredCandidate, len(candidates))
-	for i, node := range candidates {
-		tsScore := head.Sampler.SampleScore(node)
-		penalty := m.computeDiversityPenalty(node.Prefix, otherFocuses)
-
-		// Depth bonus: prefer drilling into finer prefixes
-		// This encourages exploitation of promising sub-regions
-		depthBonus := 0.0
-		bits := node.Prefix.Bits()
-		if node.Prefix.Addr().Is4() {
-			// For IPv4: /24 is max, /16 is starting point
-			// Give up to 20% bonus for finer prefixes
-			depthBonus = float64(bits-16) / 8.0 * 0.2
+	kept := head.candidates[:0]
+	for _, c := range head.candidates {
+		if c.node.selectable() && (available == nil || available(c.node.Prefix)) {
+			kept = append(kept, c)
 		} else {
-			// For IPv6: /56 is max, /32 is typical starting point
-			depthBonus = float64(bits-32) / 24.0 * 0.2
-		}
-		if depthBonus < 0 {
-			depthBonus = 0
-		}
-
-		// Combined score (lower is better)
-		// Apply diversity penalty and depth bonus
-		combined := tsScore * (1 + m.diversityWeight*penalty) * (1 - depthBonus)
-
-		scored[i] = scoredCandidate{
-			prefix:   node.Prefix,
-			combined: combined,
+			delete(head.candidateSet, c.node)
 		}
 	}
-
-	// Partial sort to get top beamWidth
-	for i := 0; i < beamWidth && i < len(scored); i++ {
-		minIdx := i
-		for j := i + 1; j < len(scored); j++ {
-			if scored[j].combined < scored[minIdx].combined {
-				minIdx = j
+	head.candidates = kept
+	accept := func(node *ArmNode) bool {
+		if _, retained := head.candidateSet[node]; retained {
+			return false
+		}
+		return node.selectable() && (available == nil || available(node.Prefix))
+	}
+	refill := len(head.candidates) < target
+	for len(head.candidates) < target {
+		node := tree.nextLeaf(&head.walk, head.Sampler, accept)
+		if node == nil {
+			break
+		}
+		head.candidates = append(head.candidates, scoredCandidate{node: node})
+		head.candidateSet[node] = struct{}{}
+	}
+	if refill || len(head.candidates) == 0 || tree.LeafCount() <= len(head.candidates) {
+		return
+	}
+	if node := tree.nextLeaf(&head.walk, head.Sampler, accept); node != nil {
+		worst := 0
+		for i := 1; i < len(head.candidates); i++ {
+			if candidateLess(head.candidates[worst], head.candidates[i]) {
+				worst = i
 			}
 		}
-		scored[i], scored[minIdx] = scored[minIdx], scored[i]
+		delete(head.candidateSet, head.candidates[worst].node)
+		head.candidates[worst] = scoredCandidate{node: node}
+		head.candidateSet[node] = struct{}{}
 	}
+}
 
-	if beamWidth > len(scored) {
-		beamWidth = len(scored)
+func candidateLess(a, b scoredCandidate) bool {
+	if a.score == b.score {
+		return prefixLess(a.node.Prefix, b.node.Prefix)
 	}
+	return a.score < b.score
+}
 
-	result := make([]netip.Prefix, beamWidth)
-	for i := 0; i < beamWidth; i++ {
-		result[i] = scored[i].prefix
+func (m *HeadManager) scoreCandidates(head *SearchHead) netip.Prefix {
+	if len(head.candidates) == 0 {
+		return netip.Prefix{}
 	}
-
-	// Update focus to best
-	if len(result) > 0 {
-		head.SetFocus(result[0])
+	otherFocuses := m.getOtherHeadFocuses(head.ID)
+	best := 0
+	for i := range head.candidates {
+		c := &head.candidates[i]
+		tsScore := head.Sampler.SampleScore(c.node)
+		penalty := m.computeDiversityPenalty(c.node.Prefix, otherFocuses)
+		bits := c.node.Prefix.Bits()
+		depthBonus := float64(bits-32) / 24.0 * 0.2
+		if c.node.Prefix.Addr().Is4() {
+			depthBonus = float64(bits-16) / 8.0 * 0.2
+		}
+		c.score = tsScore * (1 + m.diversityWeight*penalty) * (1 - max(depthBonus, 0))
+		if candidateLess(*c, head.candidates[best]) {
+			best = i
+		}
 	}
+	prefix := head.candidates[best].node.Prefix
+	head.SetFocus(prefix)
+	return prefix
+}
 
+// SelectBeam returns the current bounded candidates in sampled-score order.
+func (m *HeadManager) SelectBeam(head *SearchHead, tree *ArmTree, beamWidth int) []netip.Prefix {
+	if head == nil || tree == nil || beamWidth <= 0 {
+		return nil
+	}
+	head.selectionMu.Lock()
+	defer head.selectionMu.Unlock()
+	m.prepareCandidates(head, tree, beamWidth, nil)
+	m.scoreCandidates(head)
+	sort.Slice(head.candidates, func(i, j int) bool { return candidateLess(head.candidates[i], head.candidates[j]) })
+	result := make([]netip.Prefix, len(head.candidates))
+	for i, c := range head.candidates {
+		result[i] = c.node.Prefix
+	}
 	return result
 }
 

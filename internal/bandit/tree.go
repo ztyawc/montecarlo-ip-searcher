@@ -8,12 +8,25 @@ import (
 	"github.com/Leo-Mu/montecarlo-ip-searcher/internal/cidr"
 )
 
+const (
+	maxSplitStep = 8
+	// Limit a single expansion to a small, bounded frontier. Larger configured
+	// steps are applied across successive splits instead of allocating 2^16 arms.
+	MaxChildrenPerSplit = 1 << maxSplitStep
+	// At roughly a few hundred bytes per arm plus indexes, this bounds dynamic
+	// expansion to tens of MiB. Input roots are always retained, even above it.
+	DefaultMaxTreeNodes = 65536
+)
+
 // ArmTree manages a hierarchical tree of arm nodes organized by CIDR prefixes.
 // It supports efficient lookup, traversal, and dynamic splitting.
 type ArmTree struct {
-	roots   []*ArmNode
-	nodeMap map[netip.Prefix]*ArmNode
-	mu      sync.RWMutex
+	roots     []*ArmNode
+	nodeMap   map[netip.Prefix]*ArmNode
+	nodes     []*ArmNode
+	leaves    []*ArmNode
+	leafIndex map[netip.Prefix]int
+	mu        sync.RWMutex
 
 	// Configuration
 	splitStepV4 int
@@ -21,6 +34,7 @@ type ArmTree struct {
 	maxBitsV4   int
 	maxBitsV6   int
 	minSamples  int
+	maxNodes    int
 }
 
 // TreeConfig holds configuration for the arm tree.
@@ -30,6 +44,7 @@ type TreeConfig struct {
 	MaxBitsV4   int // Maximum prefix length for IPv4
 	MaxBitsV6   int // Maximum prefix length for IPv6
 	MinSamples  int // Minimum samples before splitting
+	MaxNodes    int // Total nodes including parents; 0 uses DefaultMaxTreeNodes
 }
 
 // DefaultTreeConfig returns sensible defaults.
@@ -40,19 +55,30 @@ func DefaultTreeConfig() TreeConfig {
 		MaxBitsV4:   24,
 		MaxBitsV6:   56,
 		MinSamples:  5, // Lower for faster drill-down
+		MaxNodes:    DefaultMaxTreeNodes,
 	}
 }
 
 // NewArmTree creates a new arm tree with the given root prefixes.
 func NewArmTree(prefixes []netip.Prefix, cfg TreeConfig) *ArmTree {
+	prefixes = cidr.RemoveContained(prefixes)
+	maxNodes := cfg.MaxNodes
+	if maxNodes == 0 {
+		maxNodes = DefaultMaxTreeNodes
+	}
+	maxNodes = max(maxNodes, len(prefixes))
 	t := &ArmTree{
 		roots:       make([]*ArmNode, 0, len(prefixes)),
 		nodeMap:     make(map[netip.Prefix]*ArmNode, len(prefixes)),
+		nodes:       make([]*ArmNode, 0, len(prefixes)),
+		leaves:      make([]*ArmNode, 0, len(prefixes)),
+		leafIndex:   make(map[netip.Prefix]int, len(prefixes)),
 		splitStepV4: cfg.SplitStepV4,
 		splitStepV6: cfg.SplitStepV6,
 		maxBitsV4:   cfg.MaxBitsV4,
 		maxBitsV6:   cfg.MaxBitsV6,
 		minSamples:  cfg.MinSamples,
+		maxNodes:    maxNodes,
 	}
 
 	for _, p := range prefixes {
@@ -62,7 +88,7 @@ func NewArmTree(prefixes []netip.Prefix, cfg TreeConfig) *ArmTree {
 		}
 		node := NewArmNode(p, nil)
 		t.roots = append(t.roots, node)
-		t.nodeMap[p] = node
+		t.addNodeLocked(node)
 	}
 
 	return t
@@ -75,9 +101,12 @@ func (t *ArmTree) GetNode(prefix netip.Prefix) *ArmNode {
 	return t.nodeMap[prefix.Masked()]
 }
 
-// GetOrCreateNode returns the arm node for the given prefix, creating it if necessary.
+// GetOrCreateNode creates a missing node when capacity permits, or returns nil.
 func (t *ArmTree) GetOrCreateNode(prefix netip.Prefix) *ArmNode {
 	prefix = prefix.Masked()
+	if !prefix.IsValid() {
+		return nil
+	}
 
 	t.mu.RLock()
 	if node, exists := t.nodeMap[prefix]; exists {
@@ -93,6 +122,9 @@ func (t *ArmTree) GetOrCreateNode(prefix netip.Prefix) *ArmNode {
 	if node, exists := t.nodeMap[prefix]; exists {
 		return node
 	}
+	if len(t.nodes) >= t.maxNodes {
+		return nil
+	}
 
 	// Find parent
 	var parent *ArmNode
@@ -104,7 +136,7 @@ func (t *ArmTree) GetOrCreateNode(prefix netip.Prefix) *ArmNode {
 	}
 
 	node := NewArmNode(prefix, parent)
-	t.nodeMap[prefix] = node
+	t.addNodeLocked(node)
 
 	if parent != nil {
 		parent.AddChild(node)
@@ -141,51 +173,133 @@ func (t *ArmTree) AllNodes() []*ArmNode {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 
-	nodes := make([]*ArmNode, 0, len(t.nodeMap))
-	for _, node := range t.nodeMap {
-		nodes = append(nodes, node)
-	}
-	return nodes
+	return append([]*ArmNode(nil), t.nodes...)
 }
 
-// LeafNodes returns all leaf nodes (nodes that haven't been split).
+// LeafNodes returns a deterministic snapshot of selectable leaves.
 func (t *ArmTree) LeafNodes() []*ArmNode {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 
-	leaves := make([]*ArmNode, 0)
-	for _, node := range t.nodeMap {
-		stats := node.Stats()
-		if !stats.IsSplit {
-			leaves = append(leaves, node)
+	return append([]*ArmNode(nil), t.leaves...)
+}
+
+func (t *ArmTree) LeafCount() int {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	return len(t.leaves)
+}
+
+// CanExpand reports whether at least a binary split fits in the node budget.
+func (t *ArmTree) CanExpand() bool {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	return t.maxNodes-len(t.nodes) >= 2
+}
+
+func (t *ArmTree) addNodeLocked(node *ArmNode) {
+	t.nodeMap[node.Prefix] = node
+	t.nodes = append(t.nodes, node)
+	t.leafIndex[node.Prefix] = len(t.leaves)
+	t.leaves = append(t.leaves, node)
+}
+
+func (t *ArmTree) removeLeafLocked(prefix netip.Prefix) {
+	idx, ok := t.leafIndex[prefix]
+	if !ok {
+		return
+	}
+	last := len(t.leaves) - 1
+	t.leaves[idx] = t.leaves[last]
+	t.leafIndex[t.leaves[idx].Prefix] = idx
+	t.leaves[last] = nil
+	t.leaves = t.leaves[:last]
+	delete(t.leafIndex, prefix)
+}
+
+// RetirePrefix excludes an exhausted leaf without discarding its statistics.
+func (t *ArmTree) RetirePrefix(prefix netip.Prefix) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	prefix = prefix.Masked()
+	if node := t.nodeMap[prefix]; node != nil {
+		node.mu.Lock()
+		node.retired = true
+		node.mu.Unlock()
+		t.removeLeafLocked(prefix)
+	}
+}
+
+// leafWalk is an implicit permutation, requiring constant memory per head.
+// A coprime stride visits every leaf once while the frontier size is unchanged.
+type leafWalk struct {
+	count, index, stride int
+}
+
+func (t *ArmTree) nextLeaf(walk *leafWalk, sampler *ThompsonSampler, accept func(*ArmNode) bool) *ArmNode {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	n := len(t.leaves)
+	if n == 0 {
+		return nil
+	}
+	if walk.count != n {
+		walk.count, walk.index = n, sampler.SampleIndex(n)
+		walk.stride = 1
+		if n > 1 {
+			walk.stride = 1 + sampler.SampleIndex(n-1)
+			for gcd(walk.stride, n) != 1 {
+				walk.stride++
+			}
 		}
 	}
-	return leaves
+	for visited := 0; visited < n; visited++ {
+		node := t.leaves[walk.index]
+		walk.index = (walk.index + walk.stride) % n
+		if accept(node) {
+			return node
+		}
+	}
+	return nil
+}
+
+func gcd(a, b int) int {
+	for b != 0 {
+		a, b = b, a%b
+	}
+	return a
 }
 
 // SplitNode splits a node into child prefixes.
 // Returns the created children, or nil if split is not possible.
 func (t *ArmTree) SplitNode(node *ArmNode) []*ArmNode {
-	if !node.CanSplit(t.minSamples, t.maxBitsV4, t.maxBitsV6) {
+	if node == nil {
+		return nil
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.nodeMap[node.Prefix] != node || !node.CanSplit(t.minSamples, t.maxBitsV4, t.maxBitsV6) {
 		return nil
 	}
 
 	prefix := node.Prefix
 	step := t.splitStepV6
+	maxBits := min(t.maxBitsV6, 128)
 	if prefix.Addr().Is4() {
 		step = t.splitStepV4
+		maxBits = min(t.maxBitsV4, 32)
+	}
+	step = min(step, maxBits-prefix.Bits(), maxSplitStep)
+	remaining := t.maxNodes - len(t.nodes)
+	for step > 0 && 1<<step > remaining {
+		step--
+	}
+	if step <= 0 {
+		return nil
 	}
 
 	children, err := cidr.SplitPrefix(prefix, step)
 	if err != nil || len(children) == 0 {
-		return nil
-	}
-
-	t.mu.Lock()
-	defer t.mu.Unlock()
-
-	// Check again under lock
-	if node.IsSplit {
 		return nil
 	}
 
@@ -197,12 +311,13 @@ func (t *ArmTree) SplitNode(node *ArmNode) []*ArmNode {
 		}
 
 		childNode := NewArmNode(childPrefix, node)
-		t.nodeMap[childPrefix] = childNode
+		t.addNodeLocked(childNode)
 		node.AddChild(childNode)
 		createdChildren = append(createdChildren, childNode)
 	}
 
 	node.MarkSplit()
+	t.removeLeafLocked(prefix)
 	return createdChildren
 }
 
@@ -210,6 +325,9 @@ func (t *ArmTree) SplitNode(node *ArmNode) []*ArmNode {
 // sorted by a combination of performance (good nodes first) and uncertainty.
 // This ensures we drill down into promising regions while also exploring uncertain ones.
 func (t *ArmTree) GetSplitCandidates(limit int) []*ArmNode {
+	if limit <= 0 || !t.CanExpand() {
+		return nil
+	}
 	leaves := t.LeafNodes()
 
 	type candidate struct {
@@ -250,6 +368,9 @@ func (t *ArmTree) GetSplitCandidates(limit int) []*ArmNode {
 
 	// Sort by priority (lowest first = best candidates)
 	sort.Slice(candidates, func(i, j int) bool {
+		if candidates[i].priority == candidates[j].priority {
+			return prefixLess(candidates[i].node.Prefix, candidates[j].node.Prefix)
+		}
 		return candidates[i].priority < candidates[j].priority
 	})
 
@@ -267,7 +388,9 @@ func (t *ArmTree) GetSplitCandidates(limit int) []*ArmNode {
 // Update updates the statistics for a prefix.
 func (t *ArmTree) Update(prefix netip.Prefix, success bool, latencyMS, timeoutMS float64) {
 	node := t.GetOrCreateNode(prefix)
-	node.Update(success, latencyMS, timeoutMS)
+	if node != nil {
+		node.Update(success, latencyMS, timeoutMS)
+	}
 }
 
 // Roots returns the root nodes.
@@ -292,9 +415,16 @@ func (t *ArmTree) TotalSamples() int {
 	defer t.mu.RUnlock()
 
 	total := 0
-	for _, node := range t.nodeMap {
+	for _, node := range t.nodes {
 		stats := node.Stats()
 		total += stats.Samples
 	}
 	return total
+}
+
+func prefixLess(a, b netip.Prefix) bool {
+	if cmp := a.Addr().Compare(b.Addr()); cmp != 0 {
+		return cmp < 0
+	}
+	return a.Bits() < b.Bits()
 }
