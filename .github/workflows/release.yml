@@ -1,26 +1,214 @@
+name: Release
+
 on:
   release:
     types: [created]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing version tag to build (for example v0.4.0)
+        required: true
+        type: string
+      publish:
+        description: Publish a draft after every asset has been verified
+        required: true
+        default: false
+        type: boolean
 
 permissions:
-    contents: write
-    packages: write
+  contents: read
+
+concurrency:
+  group: release-${{ github.event.release.tag_name || inputs.tag }}
+  cancel-in-progress: false
+
+env:
+  GO_VERSION: '1.26.3'
+  FLUTTER_VERSION: '3.47.2'
+  ANDROID_PLATFORM: 'android-36'
+  ANDROID_BUILD_TOOLS: '36.0.0'
+  ANDROID_NDK: '28.2.13676358'
+  ANDROID_SIGNING_CERT_SHA256: '9dba2d754ed2f492166c19854d6d7ca3e68ccbbfc2d6c8ca50efb75414fcf566'
+  MCIS_PRIVATE_SOCKS_LIVE: '0'
+  GOTOOLCHAIN: local
+
+defaults:
+  run:
+    shell: bash
 
 jobs:
-  releases-matrix:
-    name: release
-    runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        goos: [linux, windows, darwin]
-        goarch: [amd64, arm64]
+  prepare:
+    name: Resolve release source
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      tag: ${{ steps.source.outputs.tag }}
+      commit: ${{ steps.source.outputs.commit }}
     steps:
-    - uses: actions/checkout@v4
-    - uses: wangyoucao577/go-release-action@v1
-      with:
-        github_token: ${{ secrets.GITHUB_TOKEN }}
-        goos: ${{ matrix.goos }}
-        goarch: ${{ matrix.goarch }}
-        project_path: "./cmd/mcis"
-        binary_name: "mcis"
-        extra_files: LICENSE readme.md ipv4cidr.txt ipv6cidr.txt private-socks.example.json
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Validate tag and Android version
+        id: source
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name || inputs.tag }}
+        run: |
+          if [[ ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo '::error::An existing version tag such as v0.4.0 is required.'
+            exit 1
+          fi
+          git check-ref-format "refs/tags/$RELEASE_TAG"
+          if ! source_commit=$(git rev-parse --verify "refs/tags/$RELEASE_TAG^{commit}"); then
+            echo '::error::The requested tag does not exist. Create it at the intended source commit first.'
+            exit 1
+          fi
+          git checkout --detach "$source_commit"
+          sha256sum --check --quiet SOURCE_FILES.sha256
+          python3 scripts/release_artifacts.py check-version --tag "$RELEASE_TAG"
+          printf 'tag=%s\ncommit=%s\n' "$RELEASE_TAG" "$source_commit" >> "$GITHUB_OUTPUT"
+
+  test-go:
+    name: Go regression tests
+    needs: prepare
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.commit }}
+          persist-credentials: false
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: false
+      - run: go test -race ./... -timeout 120s
+      - run: go vet ./...
+
+  cli:
+    name: CLI ${{ matrix.goos }}/${{ matrix.goarch }}
+    needs: [prepare, test-go]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {goos: linux, goarch: amd64, runner: ubuntu-24.04, smoke: true}
+          - {goos: linux, goarch: arm64, runner: ubuntu-24.04, smoke: false}
+          - {goos: windows, goarch: amd64, runner: windows-2022, smoke: true}
+          - {goos: windows, goarch: arm64, runner: ubuntu-24.04, smoke: false}
+          - {goos: darwin, goarch: amd64, runner: ubuntu-24.04, smoke: false}
+          - {goos: darwin, goarch: arm64, runner: ubuntu-24.04, smoke: false}
+    env:
+      RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+      TARGET_OS: ${{ matrix.goos }}
+      TARGET_ARCH: ${{ matrix.goarch }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.commit }}
+          persist-credentials: false
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Build and package CLI
+        run: python scripts/release_artifacts.py build-cli --tag "$RELEASE_TAG" --goos "$TARGET_OS" --goarch "$TARGET_ARCH" --output dist
+      - name: Start the unpacked CLI without network access
+        if: matrix.smoke
+        run: python scripts/release_artifacts.py smoke-cli --tag "$RELEASE_TAG" --goos "$TARGET_OS" --goarch "$TARGET_ARCH" --output dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-cli-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 14
+
+  android:
+    name: Flutter Android arm64
+    needs: [prepare, test-go]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.commit }}
+          persist-credentials: false
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: false
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: android-actions/setup-android@v3
+      - name: Install the pinned Android SDK components
+        run: sdkmanager "platforms;$ANDROID_PLATFORM" "build-tools;$ANDROID_BUILD_TOOLS" "ndk;$ANDROID_NDK"
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+      - name: Resolve locked Flutter dependencies
+        working-directory: flutter-app
+        run: |
+          flutter --disable-analytics
+          flutter precache --android
+          flutter pub get --enforce-lockfile
+      - name: Flutter regression tests
+        working-directory: flutter-app
+        run: |
+          flutter analyze --no-pub
+          flutter test --no-pub
+      - name: Android host regression tests
+        run: bash scripts/test-android-native.sh
+      - name: Build the Android application and Go core
+        working-directory: flutter-app
+        run: flutter build apk --release --target-platform android-arm64 --no-pub
+      - name: Sign and verify the Android release
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: bash scripts/sign-android-release.sh "$RELEASE_TAG" dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-android-arm64
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    name: Verify and upload release assets
+    needs: [prepare, cli, android]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    env:
+      RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_REPO: ${{ github.repository }}
+      PUBLISH_RELEASE: ${{ github.event_name == 'workflow_dispatch' && inputs.publish && 'true' || 'false' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.commit }}
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
+      - name: Verify the complete asset set and write checksums
+        run: python3 scripts/release_artifacts.py verify-release --tag "$RELEASE_TAG" --output dist
+      - name: Upload and download-check every asset
+        run: python3 scripts/release_artifacts.py upload-release --tag "$RELEASE_TAG" --output dist

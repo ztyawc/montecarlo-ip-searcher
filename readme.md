@@ -31,13 +31,27 @@
 
 ## 下载安装
 
-[本仓库 Release](https://github.com/ztyawc/montecarlo-ip-searcher/releases/latest) 提供已发布的命令行版本，下载解压后可在终端运行。源码同步不会自动发布新版本；使用本次修复及 Android 客户端时，请按下面的源码构建说明构建。
+[本仓库 Release](https://github.com/ztyawc/montecarlo-ip-searcher/releases/latest) 提供以下程序，按设备选择对应附件：
+
+| 平台 | 下载文件 | 使用方式 |
+| --- | --- | --- |
+| Windows，常见 Intel / AMD 64 位电脑 | `mcis-版本-windows-amd64.zip` | 解压，在终端运行 `mcis.exe` |
+| Windows ARM64 | `mcis-版本-windows-arm64.zip` | 解压，在终端运行 `mcis.exe` |
+| Linux x86_64 / ARM64 | `mcis-版本-linux-amd64.tar.gz` / `linux-arm64.tar.gz` | 解压，在终端运行 `./mcis` |
+| macOS Intel / Apple Silicon | `mcis-版本-darwin-amd64.tar.gz` / `darwin-arm64.tar.gz` | 解压，在终端运行 `./mcis` |
+| Android 8.0+，64 位 ARM 设备 | `mcis-版本-android-arm64-v8a.apk` | 安装带正式签名的 Flutter 图形界面 APP |
+
+桌面版本是命令行程序。压缩包包含 IPv4 / IPv6 网段、配置示例和使用说明；Android APK 内置搜索核心与网段，无需另外安装 Go 或 Flutter。Release 同时提供 `SHA256SUMS` 校验文件。
+
+发布流程会先完成测试、构建和签名验证，再上传附件。普通推送或合并不会直接创建 Release；维护者操作见 [发布说明](docs/releases.md)。
 
 ### Android App
 
 新版 Android 客户端位于 [`flutter-app`](flutter-app/README.md)，采用 Flutter＋`flutter_miuix` 的 HyperOS 风格界面，通过 Android 平台通道复用 Go 搜索核心，支持 IPv4/IPv6、下载测速、Colo 筛选，以及私有 SOCKS `0x80` / `0x82`。包含优选、结果、设置三个页面和浅色/深色主题。
 
 构建目标为 `arm64-v8a`，最低支持 Android 8.0。旧版 Java 界面保留在 [`android-app`](android-app/README.md)，用于回退和共享第一阶段的进程生命周期实现。完整源码包的同步方法见 [`GITHUB_SYNC.md`](GITHUB_SYNC.md)。
+
+本次正式发布使用 Flutter 客户端。两套 Android 客户端包名相同，不能同时安装；已有版本只有使用同一签名时才能直接覆盖升级。应用目前需要保持前台，扫描结果尚未持久化。
 
 ## 推荐配置
 

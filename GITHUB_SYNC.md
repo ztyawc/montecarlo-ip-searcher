@@ -16,29 +16,29 @@
 从源码快照同步时，在目标仓库的克隆中按清单逐项复制，保留目标仓库的 Git 历史。若远程已有较新修改，先比较并合并；核对内容后再暂存清单内文件和清单本身。
 
 ```bash
-git clone --branch flutter-ui-0.4.0 https://github.com/ztyawc/montecarlo-ip-searcher.git
+git clone https://github.com/ztyawc/montecarlo-ip-searcher.git
 cd montecarlo-ip-searcher
 sha256sum -c SOURCE_FILES.sha256
 git status --short
 git diff --stat
 ```
 
-校验清单随文件内容更新。提交前还应检查暂存差异，确保没有加入清单之外的本机文件。推送到 `flutter-ui-0.4.0` 后，合并请求的目标仓库为 `ztyawc/montecarlo-ip-searcher`，目标分支为 `main`。
+校验清单随文件内容更新。提交前还应检查暂存差异，确保没有加入清单之外的本机文件。首批源码已通过 PR #1 合并到 `ztyawc/montecarlo-ip-searcher` 的 `main`；后续构建从 `main` 或明确的发布标签检出完整仓库。
 
 ## 自动构建范围
 
-现有 [Release 工作流](.github/workflows/release.yml) 只由创建 Release 事件触发：
+[Release 工作流](.github/workflows/release.yml) 支持创建 Release 事件，以及在 Actions 页面手动选择发布标签运行：
 
 | 目标 | 当前构建方式 |
 | --- | --- |
-| Windows、Linux、macOS 命令行工具 | Release 工作流配置为分别构建 amd64 和 arm64，共六种组合 |
-| Flutter Android APP | 本地手动构建，仅 arm64-v8a；未配置签名时输出未签名 APK |
-| Java Android APP | 本地手动构建，仅 arm64-v8a；release 默认未签名 |
+| Windows、Linux、macOS 命令行工具 | 自动构建 amd64 和 arm64，共六种组合 |
+| Flutter Android APP | 自动构建 arm64-v8a APK，并用仓库 Actions Secrets 中的正式密钥签名和验证 |
+| Java Android APP | 保留源码供手动构建，本次不重复发布同包名 APP |
 | iOS、Windows/macOS/Linux 图形界面 APP | 尚未实现对应平台宿主和构建流程 |
 
-普通推送和合并请求不会触发上述 Release 工作流，也不会自动创建新版本或替换已有附件。仓库当前没有提交或 PR 测试工作流。
+普通推送和合并请求不会直接发布新版本。发布工作流包含 Go、Flutter、Java 检查、Windows/Linux 命令行启动检查和 APK 签名验证；只有所需任务全部成功，才汇总上传产物。创建新版本建议使用手动入口，先保留为草稿，核对附件后公开。已公开 Release 的同名附件不会被工作流覆盖。
 
-Android 构建要求与命令见 [Flutter 说明](flutter-app/README.md)和 [Java 客户端说明](android-app/README.md)。签名与安装包发布需要另行配置。
+签名 Secrets、发布步骤和重跑规则见 [发布说明](docs/releases.md)。Android 本机构建要求与命令见 [Flutter 说明](flutter-app/README.md)和 [Java 客户端说明](android-app/README.md)。
 
 ## 验证记录
 

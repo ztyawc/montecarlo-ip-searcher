@@ -1,2 +1,10 @@
 mcis.exe
 private-socks.json
+dist/
+**/key.properties
+**/keystore.properties
+*.jks
+*.keystore
+*.p12
+__pycache__/
+*.pyc
