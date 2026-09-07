@@ -1,20 +1,16 @@
 package dns
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
-	"net/netip"
 	"net/url"
-	"strings"
+	"strconv"
 )
 
 const vercelAPIBase = "https://api.vercel.com"
 
-// VercelProvider implements Provider for Vercel DNS.
 type VercelProvider struct {
 	token  string
 	domain string
@@ -22,201 +18,168 @@ type VercelProvider struct {
 	client *http.Client
 }
 
-// NewVercelProvider creates a new Vercel DNS provider.
 func NewVercelProvider(token, domain, teamID string) *VercelProvider {
-	return &VercelProvider{
-		token:  token,
-		domain: domain,
-		teamID: teamID,
-		client: &http.Client{},
-	}
+	return &VercelProvider{token: token, domain: domain, teamID: teamID, client: newHTTPClient()}
 }
 
-func (p *VercelProvider) Name() string {
-	return "vercel"
-}
+func (p *VercelProvider) Name() string { return "vercel" }
 
-// vercelDNSRecord represents a Vercel DNS record.
 type vercelDNSRecord struct {
-	ID    string `json:"id"`
-	Type  string `json:"type"`
-	Name  string `json:"name"`
-	Value string `json:"value"`
-	TTL   int    `json:"ttl,omitempty"`
+	ID      string  `json:"id"`
+	Type    string  `json:"type"`
+	Name    *string `json:"name"` // Empty is the apex; absent is an invalid response.
+	Value   string  `json:"value"`
+	TTL     int     `json:"ttl"`
+	Comment string  `json:"comment"`
 }
 
-// vercelListResponse represents the Vercel API list response.
-type vercelListResponse struct {
-	Records    []vercelDNSRecord `json:"records"`
-	Pagination struct {
-		Count int    `json:"count"`
-		Next  string `json:"next"`
-		Prev  string `json:"prev"`
-	} `json:"pagination"`
+func (r vercelDNSRecord) record() Record {
+	return Record{ID: r.ID, Type: r.Type, Content: r.Value, TTL: r.TTL, Comment: r.Comment}
 }
 
-// vercelErrorResponse represents a Vercel API error response.
-type vercelErrorResponse struct {
-	Error struct {
-		Code    string `json:"code"`
-		Message string `json:"message"`
-	} `json:"error"`
-}
-
-// DeleteRecords deletes all A or AAAA records for the subdomain.
-func (p *VercelProvider) DeleteRecords(ctx context.Context, subdomain string, ipv6 bool) error {
-	recordType := "A"
-	if ipv6 {
-		recordType = "AAAA"
-	}
-
-	// List existing records
-	records, err := p.listRecords(ctx)
+func (p *VercelProvider) requestURL(version, recordID string, query url.Values) (string, error) {
+	domain, err := normalizeDomain(p.domain)
 	if err != nil {
-		return err
+		return "", fmt.Errorf("invalid Vercel domain: %w", err)
 	}
+	path := vercelAPIBase + "/" + version + "/domains/" + url.PathEscape(domain) + "/records"
+	if recordID != "" {
+		path += "/" + url.PathEscape(recordID)
+	}
+	if query == nil {
+		query = make(url.Values)
+	}
+	if p.teamID != "" {
+		query.Set("teamId", p.teamID)
+	}
+	if len(query) > 0 {
+		path += "?" + query.Encode()
+	}
+	return path, nil
+}
 
-	// Filter and delete matching records
-	for _, rec := range records {
-		if rec.Type == recordType && rec.Name == subdomain {
-			if err := p.deleteRecord(ctx, rec.ID); err != nil {
-				return fmt.Errorf("delete record %s: %w", rec.ID, err)
+func (p *VercelProvider) ListRecords(ctx context.Context, subdomain string) ([]Record, error) {
+	name, err := normalizeSubdomain(subdomain)
+	if err != nil {
+		return nil, err
+	}
+	var records []Record
+	seen := make(map[string]vercelDNSRecord)
+	cursors := make(map[int64]bool)
+	query := url.Values{"limit": {strconv.Itoa(dnsPageSize)}}
+	for page := 0; page < maxDNSPages; page++ {
+		requestURL, err := p.requestURL("v5", "", query)
+		if err != nil {
+			return nil, err
+		}
+		var result struct {
+			Error      json.RawMessage `json:"error"`
+			Records    json.RawMessage `json:"records"`
+			Pagination *struct {
+				Next json.RawMessage `json:"next"`
+			} `json:"pagination"`
+		}
+		if err := requestJSON(ctx, p.client, http.MethodGet, requestURL, p.token, nil, &result); err != nil {
+			return nil, err
+		}
+		if len(result.Error) > 0 {
+			return nil, fmt.Errorf("Vercel record list contains an error")
+		}
+		var rows []vercelDNSRecord
+		if err := json.Unmarshal(result.Records, &rows); err != nil || rows == nil {
+			return nil, fmt.Errorf("invalid Vercel record list")
+		}
+		newIDs := 0
+		for _, r := range rows {
+			if r.ID == "" || r.Type == "" || r.Name == nil {
+				return nil, fmt.Errorf("incomplete Vercel DNS record")
+			}
+			if previous, ok := seen[r.ID]; ok {
+				if *previous.Name != *r.Name || !sameRecord(previous.record(), r.record()) {
+					return nil, fmt.Errorf("Vercel record %s changed during pagination", r.ID)
+				}
+				continue
+			}
+			seen[r.ID] = r
+			newIDs++
+			recordName, err := normalizeSubdomain(*r.Name)
+			if err == nil && recordName == name && (r.Type == "A" || r.Type == "AAAA") {
+				records = append(records, r.record())
 			}
 		}
+		if result.Pagination == nil {
+			// The documented unpaginated response is only safe with fewer than
+			// the explicitly requested limit; a full page needs a next cursor.
+			if len(rows) >= dnsPageSize {
+				return nil, fmt.Errorf("Vercel full page is missing pagination")
+			}
+			return checkedRecords(records)
+		}
+		var next *int64
+		if err := json.Unmarshal(result.Pagination.Next, &next); err != nil {
+			return nil, fmt.Errorf("invalid Vercel pagination cursor: %w", err)
+		}
+		if next == nil {
+			return checkedRecords(records)
+		}
+		if *next < 0 || cursors[*next] || newIDs == 0 {
+			return nil, fmt.Errorf("Vercel pagination did not advance")
+		}
+		cursors[*next] = true
+		query.Set("until", strconv.FormatInt(*next, 10))
 	}
-	return nil
+	return nil, fmt.Errorf("Vercel pagination exceeded %d pages", maxDNSPages)
 }
 
-// CreateRecords creates A/AAAA records for the given IPs.
-func (p *VercelProvider) CreateRecords(ctx context.Context, subdomain string, ips []netip.Addr) error {
-	for _, ip := range ips {
-		recordType := "A"
-		if ip.Is6() {
-			recordType = "AAAA"
-		}
-		if err := p.createRecord(ctx, subdomain, recordType, ip.String()); err != nil {
-			return fmt.Errorf("create record for %s: %w", ip.String(), err)
-		}
+func (p *VercelProvider) CreateRecord(ctx context.Context, subdomain string, record Record) (Record, error) {
+	if _, err := recordKey(record); err != nil {
+		return Record{}, err
 	}
-	return nil
-}
-
-func (p *VercelProvider) buildURL(path string) string {
-	u := vercelAPIBase + path
-	if p.teamID != "" {
-		if strings.Contains(u, "?") {
-			u += "&teamId=" + url.QueryEscape(p.teamID)
-		} else {
-			u += "?teamId=" + url.QueryEscape(p.teamID)
-		}
-	}
-	return u
-}
-
-func (p *VercelProvider) listRecords(ctx context.Context) ([]vercelDNSRecord, error) {
-	path := fmt.Sprintf("/v4/domains/%s/records", url.PathEscape(p.domain))
-	reqURL := p.buildURL(path)
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
+	name, err := normalizeSubdomain(subdomain)
 	if err != nil {
-		return nil, err
+		return Record{}, err
 	}
-	req.Header.Set("Authorization", "Bearer "+p.token)
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := p.client.Do(req)
+	requestURL, err := p.requestURL("v2", "", nil)
 	if err != nil {
-		return nil, err
+		return Record{}, err
 	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, err
+	if record.TTL == 0 {
+		record.TTL = 60
 	}
-
-	if resp.StatusCode >= 400 {
-		var errResp vercelErrorResponse
-		if json.Unmarshal(body, &errResp) == nil && errResp.Error.Message != "" {
-			return nil, fmt.Errorf("vercel API error: %s", errResp.Error.Message)
-		}
-		return nil, fmt.Errorf("vercel API error: status %d", resp.StatusCode)
+	payload := map[string]any{
+		"name": name, "type": record.Type, "value": record.Content, "ttl": record.TTL,
 	}
-
-	var result vercelListResponse
-	if err := json.Unmarshal(body, &result); err != nil {
-		return nil, fmt.Errorf("parse response: %w", err)
+	if record.Comment != "" {
+		payload["comment"] = record.Comment
 	}
-
-	return result.Records, nil
+	var result struct {
+		UID   string          `json:"uid"`
+		Error json.RawMessage `json:"error"`
+	}
+	if err := requestJSON(ctx, p.client, http.MethodPost, requestURL, p.token, payload, &result); err != nil {
+		return Record{}, err
+	}
+	if result.UID == "" || len(result.Error) > 0 {
+		return Record{}, fmt.Errorf("Vercel creation response did not identify the new record")
+	}
+	record.ID = result.UID
+	return record, nil
 }
 
-func (p *VercelProvider) deleteRecord(ctx context.Context, recordID string) error {
-	path := fmt.Sprintf("/v2/domains/%s/records/%s", url.PathEscape(p.domain), url.PathEscape(recordID))
-	reqURL := p.buildURL(path)
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, reqURL, nil)
+func (p *VercelProvider) DeleteRecord(ctx context.Context, recordID string) error {
+	if recordID == "" {
+		return fmt.Errorf("Vercel record ID must not be empty")
+	}
+	requestURL, err := p.requestURL("v2", recordID, nil)
 	if err != nil {
 		return err
 	}
-	req.Header.Set("Authorization", "Bearer "+p.token)
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := p.client.Do(req)
-	if err != nil {
+	var result map[string]json.RawMessage
+	if err := requestJSON(ctx, p.client, http.MethodDelete, requestURL, p.token, nil, &result); err != nil {
 		return err
 	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode >= 400 {
-		body, _ := io.ReadAll(resp.Body)
-		var errResp vercelErrorResponse
-		if json.Unmarshal(body, &errResp) == nil && errResp.Error.Message != "" {
-			return fmt.Errorf("vercel API error: %s", errResp.Error.Message)
-		}
-		return fmt.Errorf("vercel API error: status %d", resp.StatusCode)
+	if _, failed := result["error"]; failed {
+		return fmt.Errorf("Vercel deletion response contains an error")
 	}
-
-	return nil
-}
-
-func (p *VercelProvider) createRecord(ctx context.Context, name, recordType, value string) error {
-	path := fmt.Sprintf("/v2/domains/%s/records", url.PathEscape(p.domain))
-	reqURL := p.buildURL(path)
-
-	payload := map[string]interface{}{
-		"name":  name,
-		"type":  recordType,
-		"value": value,
-		"ttl":   60,
-	}
-
-	data, err := json.Marshal(payload)
-	if err != nil {
-		return err
-	}
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, reqURL, bytes.NewReader(data))
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Authorization", "Bearer "+p.token)
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := p.client.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode >= 400 {
-		body, _ := io.ReadAll(resp.Body)
-		var errResp vercelErrorResponse
-		if json.Unmarshal(body, &errResp) == nil && errResp.Error.Message != "" {
-			return fmt.Errorf("vercel API error: %s", errResp.Error.Message)
-		}
-		return fmt.Errorf("vercel API error: status %d", resp.StatusCode)
-	}
-
 	return nil
 }

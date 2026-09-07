@@ -2,22 +2,17 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"flag"
 	"fmt"
-	"net/netip"
-	"net/url"
 	"os"
 	"os/signal"
 	"regexp"
-	"sort"
 	"strings"
 	"syscall"
 	"time"
 
 	"github.com/Leo-Mu/montecarlo-ip-searcher/internal/dns"
 	"github.com/Leo-Mu/montecarlo-ip-searcher/internal/engine"
-	"github.com/Leo-Mu/montecarlo-ip-searcher/internal/output"
 	"github.com/Leo-Mu/montecarlo-ip-searcher/internal/privatesocks"
 	"github.com/Leo-Mu/montecarlo-ip-searcher/internal/probe"
 )
@@ -68,32 +63,34 @@ func isValidDomain(domain string) bool {
 
 func main() {
 	var (
-		cidrs     repeatStringFlag
-		cidrFile  string
-		budget    int
-		topN      int
-		concur    int
-		heads     int
-		beam      int
-		timeout   time.Duration
-		host      string
-		sni       string
-		hostHdr   string
-		path      string
-		dlTop     int
-		dlBytes   int64
-		dlTimeout time.Duration
-		dlURL     string
-		dlMode    string
-		outFmt    string
-		outPath   string
-		splitV4   int
-		splitV6   int
-		minSplit  int
-		maxBitsV4 int
-		maxBitsV6 int
-		seed      int64
-		verbose   bool
+		cidrs      repeatStringFlag
+		cidrFile   string
+		budget     int
+		topN       int
+		concur     int
+		heads      int
+		beam       int
+		timeout    time.Duration
+		host       string
+		sni        string
+		hostHdr    string
+		path       string
+		probeMode  string
+		dlTop      int
+		dlBytes    int64
+		dlMinBytes int64
+		dlTimeout  time.Duration
+		dlURL      string
+		dlMode     string
+		outFmt     string
+		outPath    string
+		splitV4    int
+		splitV6    int
+		minSplit   int
+		maxBitsV4  int
+		maxBitsV6  int
+		seed       int64
+		verbose    bool
 
 		// DNS upload flags
 		dnsProvider    string
@@ -102,6 +99,7 @@ func main() {
 		dnsSubdomain   string
 		dnsUploadCount int
 		dnsTeamID      string
+		dnsTimeout     time.Duration
 
 		// New engine parameters
 		diversityWeight float64
@@ -136,12 +134,14 @@ func main() {
 	flag.StringVar(&sni, "sni", "", "TLS SNI server name (deprecated: use --host)")
 	flag.StringVar(&hostHdr, "host-header", "", "HTTP Host header (deprecated: use --host)")
 	flag.StringVar(&path, "path", "/cdn-cgi/trace", "HTTP path to request")
+	flag.StringVar(&probeMode, "probe-mode", "auto", "Response validation: auto (trace endpoint only)|trace|http; response limit 64 KiB")
 	flag.IntVar(&dlTop, "download-top", 5, "After search, run download speed test for top N IPs (0 to disable)")
 	flag.Int64Var(&dlBytes, "download-bytes", 0, "Download test size in bytes; 0 = 50M for default endpoint, no limit for custom URL (default: 0)")
+	flag.Int64Var(&dlMinBytes, "download-min-bytes", probe.DefaultMinDownloadBytes, "Minimum bytes for a valid download speed sample")
 	flag.DurationVar(&dlTimeout, "download-timeout", 45*time.Second, "Per-IP download test timeout")
 	flag.StringVar(&dlURL, "download-url", "", "Custom download test URL (e.g. https://myhost.com/path/to/file). Overrides default speed.cloudflare.com")
 	flag.StringVar(&dlMode, "download-mode", "all", "Download test mode: 'all' (test top N) or 'sequential' (test sequentially until N successes)")
-	flag.StringVar(&outFmt, "out", "jsonl", "Output format: jsonl|csv|text")
+	flag.StringVar(&outFmt, "out", "jsonl", "Output format: jsonl|csv|text|debug")
 	flag.StringVar(&outPath, "out-file", "", "Write output to file (default: stdout)")
 	flag.IntVar(&splitV4, "split-step-v4", 2, "When splitting an IPv4 prefix, increase prefix bits by this step")
 	flag.IntVar(&splitV6, "split-step-v6", 4, "When splitting an IPv6 prefix, increase prefix bits by this step")
@@ -158,6 +158,7 @@ func main() {
 	flag.StringVar(&dnsSubdomain, "dns-subdomain", "", "Subdomain to update (e.g., 'cf' for cf.example.com)")
 	flag.IntVar(&dnsUploadCount, "dns-upload-count", 0, "Number of IPs to upload (default: same as --download-top)")
 	flag.StringVar(&dnsTeamID, "dns-team-id", "", "Vercel Team ID (optional, or use VERCEL_TEAM_ID env)")
+	flag.DurationVar(&dnsTimeout, "dns-timeout", dns.DefaultUploadTimeout, "Total DNS upload timeout, starting after results are saved")
 
 	// New engine parameters
 	flag.Float64Var(&diversityWeight, "diversity-weight", 0.3, "Weight for head diversity (0-1, higher = more exploration)")
@@ -181,6 +182,35 @@ func main() {
 	flag.StringVar(&coloExclude, "colo-exclude", "", "Comma-separated colo blacklist; exclude these CDN nodes from results (e.g. LAX,DFW)")
 
 	flag.Parse()
+	if flag.NArg() != 0 {
+		fmt.Fprintln(os.Stderr, "error: unexpected positional arguments; use --cidr or --cidr-file")
+		os.Exit(1)
+	}
+	if err := validateProbeOptions(timeout, rounds, skipFirst, probeMode); err != nil {
+		fmt.Fprintln(os.Stderr, "error:", err)
+		os.Exit(1)
+	}
+	dlCfg, err := prepareDownloadConfig(downloadOptions{top: dlTop, bytes: dlBytes, minBytes: dlMinBytes, timeout: dlTimeout, url: dlURL, mode: dlMode})
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "error:", err)
+		os.Exit(1)
+	}
+	if err := validateOutputOptions(outputOptions{format: outFmt, path: outPath}); err != nil {
+		fmt.Fprintln(os.Stderr, "error:", err)
+		os.Exit(1)
+	}
+	dnsPlan, err := prepareDNSUpload(dns.Config{
+		Provider:    dnsProvider,
+		Token:       dnsToken,
+		Zone:        dnsZone,
+		Subdomain:   dnsSubdomain,
+		UploadCount: dnsUploadCount,
+		TeamID:      dnsTeamID,
+	}, dlTop, dnsTimeout)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "error:", err)
+		os.Exit(1)
+	}
 
 	visitedFlags := make(map[string]bool)
 	flag.Visit(func(flagValue *flag.Flag) {
@@ -238,6 +268,10 @@ func main() {
 
 	var privateSOCKSDialer *privatesocks.Dialer
 	if privateSOCKSAddress != "" {
+		if privateSOCKSTimeout <= 0 {
+			fmt.Fprintln(os.Stderr, "error: --private-socks-timeout must be > 0")
+			os.Exit(1)
+		}
 		method, err := privatesocks.ParseMethod(privateSOCKSMethod)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "error:", err)
@@ -307,18 +341,24 @@ func main() {
 		ColoAllow:       parseColoList(coloAllow),
 		ColoBlock:       parseColoList(coloExclude),
 	}
+	if err := cfg.Validate(); err != nil {
+		fmt.Fprintln(os.Stderr, "error:", err)
+		os.Exit(1)
+	}
 
 	probeCfg := probe.Config{
 		Timeout:    timeout,
 		SNI:        sni,
 		HostHeader: hostHdr,
 		Path:       path,
+		Mode:       probeMode,
 		Rounds:     rounds,
 		SkipFirst:  skipFirst,
 	}
 	if privateSOCKSDialer != nil {
 		probeCfg.DialContext = privateSOCKSDialer.DialContext
 	}
+	dlCfg.DialContext = probeCfg.DialContext
 
 	req := engine.Request{
 		CIDRs:    []string(cidrs),
@@ -335,52 +375,23 @@ func main() {
 	}
 
 	// Download speed test
-	if dlTop < 0 {
-		dlTop = 0
-	}
 	if dlTop > 0 {
 		if dlTop > len(res.Top) {
 			dlTop = len(res.Top)
 		}
-		// Default Bytes=0 (no limit); when no custom URL use 50M.
-		if dlBytes == 0 && dlURL == "" {
-			dlBytes = 50_000_000
-		}
-		dlCfg := probe.DownloadConfig{
-			Timeout:     dlTimeout,
-			Bytes:       dlBytes,
-			DialContext: probeCfg.DialContext,
-		}
-		if dlURL != "" {
-			u, err := url.Parse(dlURL)
-			if err != nil {
-				fmt.Fprintln(os.Stderr, "error: invalid --download-url:", err)
-				os.Exit(1)
-			}
-			if u.Hostname() == "" {
-				fmt.Fprintln(os.Stderr, "error: --download-url must include a hostname (e.g. https://myhost.com/path/to/file)")
-				os.Exit(1)
-			}
-			dlCfg.SNI = u.Hostname()
-			dlCfg.HostName = u.Hostname()
-			dlCfg.Path = u.Path
-			if u.RawQuery != "" {
-				dlCfg.Path = u.Path + "?" + u.RawQuery
-			}
-			dlCfg.CustomURL = true
-		}
 		dlp := probe.NewDownloadProber(dlCfg)
+		defer dlp.Close()
 		if verbose {
 			if dlURL != "" {
 				bytesDesc := fmt.Sprintf("max %d bytes", dlCfg.Bytes)
 				if dlCfg.Bytes == 0 {
 					bytesDesc = "full file (no limit)"
 				}
-				fmt.Fprintf(os.Stderr, "download: using custom URL host=%s path=%s (top %d IPs, %s)\n",
-					dlCfg.HostName, dlCfg.Path, dlTop, bytesDesc)
+				fmt.Fprintf(os.Stderr, "download: using custom URL %s (top %d IPs, %s)\n",
+					downloadDisplayURL(dlURL), dlTop, bytesDesc)
 			} else {
 				fmt.Fprintf(os.Stderr, "download: using default speed.cloudflare.com/__down (top %d IPs, %d bytes)\n",
-					dlTop, dlBytes)
+					dlTop, dlCfg.Bytes)
 			}
 		}
 		// Download test with mode support
@@ -421,120 +432,7 @@ func main() {
 		}
 	}
 
-	// DNS upload
-	if dnsProvider != "" {
-		if dnsSubdomain == "" {
-			fmt.Fprintln(os.Stderr, "error: --dns-subdomain is required when --dns-provider is set")
-			os.Exit(1)
-		}
-		if dlTop <= 0 {
-			fmt.Fprintln(os.Stderr, "error: --download-top must be > 0 when using DNS upload")
-			os.Exit(1)
-		}
-
-		dnsCfg := dns.Config{
-			Provider:    dnsProvider,
-			Token:       dnsToken,
-			Zone:        dnsZone,
-			Subdomain:   dnsSubdomain,
-			UploadCount: dnsUploadCount,
-			TeamID:      dnsTeamID,
-		}
-
-		provider, err := dns.NewProvider(dnsCfg)
-		if err != nil {
-			fmt.Fprintln(os.Stderr, "error:", err)
-			os.Exit(1)
-		}
-
-		// Collect IPs from download-tested results only
-		type dlResult struct {
-			IP   netip.Addr
-			Mbps float64
-		}
-		var candidates []dlResult
-		for i := 0; i < dlTop && i < len(res.Top); i++ {
-			r := res.Top[i]
-			if r.DownloadOK {
-				candidates = append(candidates, dlResult{IP: r.IP, Mbps: r.DownloadMbps})
-			}
-		}
-
-		// Sort by download speed (highest first)
-		sort.Slice(candidates, func(i, j int) bool {
-			return candidates[i].Mbps > candidates[j].Mbps
-		})
-
-		// Determine how many IPs to upload
-		uploadN := dnsCfg.UploadCount
-		if uploadN <= 0 {
-			uploadN = dlTop
-		}
-		if uploadN > len(candidates) {
-			uploadN = len(candidates)
-		}
-
-		// Collect IPs to upload
-		var ipsToUpload []netip.Addr
-		for i := 0; i < uploadN; i++ {
-			ipsToUpload = append(ipsToUpload, candidates[i].IP)
-		}
-
-		if len(ipsToUpload) > 0 {
-			if verbose {
-				fmt.Fprintf(os.Stderr, "dns: uploading %d IPs to %s (subdomain: %s), sorted by download speed...\n",
-					len(ipsToUpload), provider.Name(), dnsSubdomain)
-				for i, ip := range ipsToUpload {
-					fmt.Fprintf(os.Stderr, "  %d. %s (%.2f Mbps)\n", i+1, ip.String(), candidates[i].Mbps)
-				}
-			}
-			if err := dns.Upload(ctx, provider, dnsSubdomain, ipsToUpload, verbose); err != nil {
-				fmt.Fprintln(os.Stderr, "dns upload error:", err)
-				os.Exit(1)
-			}
-		} else {
-			if verbose {
-				fmt.Fprintln(os.Stderr, "dns: no successful download-tested IPs to upload")
-			}
-		}
-	}
-
-	// Output
-	var w *os.File = os.Stdout
-	if outPath != "" {
-		f, err := os.Create(outPath)
-		if err != nil {
-			fmt.Fprintln(os.Stderr, "error:", err)
-			os.Exit(1)
-		}
-		defer func() {
-			_ = f.Close()
-		}()
-		w = f
-	}
-
-	switch outFmt {
-	case "jsonl":
-		if err := output.WriteJSONL(w, res.Top); err != nil {
-			fmt.Fprintln(os.Stderr, "error:", err)
-			os.Exit(1)
-		}
-	case "csv":
-		if err := output.WriteCSV(w, res.Top); err != nil {
-			fmt.Fprintln(os.Stderr, "error:", err)
-			os.Exit(1)
-		}
-	case "text":
-		if err := output.WriteText(w, res.Top); err != nil {
-			fmt.Fprintln(os.Stderr, "error:", err)
-			os.Exit(1)
-		}
-	case "debug":
-		enc := json.NewEncoder(w)
-		enc.SetIndent("", "  ")
-		_ = enc.Encode(res)
-	default:
-		fmt.Fprintln(os.Stderr, "error: unknown -out:", outFmt)
-		os.Exit(1)
+	if code := finishRun(ctx, res, outputOptions{format: outFmt, path: outPath}, dnsPlan, verbose, os.Stdout, os.Stderr, dns.Upload); code != 0 {
+		os.Exit(code)
 	}
 }

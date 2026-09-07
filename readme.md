@@ -8,9 +8,9 @@
 - **扫描少了** → 随机打靶，可能错过真正的好 IP
 - **扫描多了** → 耗时太长，还容易触发运营商风控
 
-**mcis 的核心价值：用 1/600 的探测次数，找到接近全段扫描的最优 IP。**
+**mcis 用指定预算探索网段，并把一部分后续探测投入已有成功结果的区域。**
 
-传统工具是"广撒网"，而 mcis 是"精准制导"——通过智能搜索把有限的探测预算集中到真正有潜力的 IP 段，好钢用在刀刃上。
+3000 次探测相对 180 万地址约为 1/600 的预算，这个比例不代表能保证找到全局最优。效果取决于可用 IP 的分布和失败率；本轮合成对照在集中分布中更好，在分散或高失败场景中未普遍优于随机采样。测试方法与完整结果见 [第二、三批修复说明](docs/reliability-search-fixes.md)。
 
 **效率对比（以 Cloudflare IPv4 为例）：**
 
@@ -31,7 +31,13 @@
 
 ## 下载安装
 
-[Release](https://github.com/Leo-Mu/montecarlo-ip-searcher/releases/latest) 下载解压后，在文件夹中右键打开终端即可运行。
+[本仓库 Release](https://github.com/ztyawc/montecarlo-ip-searcher/releases/latest) 提供已发布的命令行版本，下载解压后可在终端运行。源码同步不会自动发布新版本；使用本次修复及 Android 客户端时，请按下面的源码构建说明构建。
+
+### Android App
+
+新版 Android 客户端位于 [`flutter-app`](flutter-app/README.md)，采用 Flutter＋`flutter_miuix` 的 HyperOS 风格界面，通过 Android 平台通道复用 Go 搜索核心，支持 IPv4/IPv6、下载测速、Colo 筛选，以及私有 SOCKS `0x80` / `0x82`。包含优选、结果、设置三个页面和浅色/深色主题。
+
+构建目标为 `arm64-v8a`，最低支持 Android 8.0。旧版 Java 界面保留在 [`android-app`](android-app/README.md)，用于回退和共享第一阶段的进程生命周期实现。完整源码包的同步方法见 [`GITHUB_SYNC.md`](GITHUB_SYNC.md)。
 
 ## 推荐配置
 
@@ -89,7 +95,7 @@ go run ./cmd/mcis -v --out text --cidr-file ./ipv6cidr.txt --budget 4000 --heads
 | `--max-bits-v6` | 56 | 1-128 | IPv6 最大前缀长度 |
 | `--rounds` | 6 | 3-10 | 每个 IP 测试次数 |
 | `--skip-first` | 1 | 0-3 | 跳过前 N 次测试（去除握手开销） |
-| `--seed` | 0 | ≥0 | 随机种子（0=时间种子） |
+| `--seed` | 0 | 有符号 64 位整数 | 随机种子（0=时间种子） |
 
 ## 参数详解
 
@@ -112,11 +118,16 @@ go run ./cmd/mcis -v --out text --cidr-file ./ipv6cidr.txt --budget 4000 --heads
 - `--out-file`：输出到文件（默认输出到终端）
 - `-v`：显示搜索进度（强烈推荐开启）
 
+文件输出先写入同目录临时文件，编码、刷新与关闭均成功后再替换目标文件；失败不会发布半写结果。已有文件保留权限，新文件默认仅当前用户可读写。`--out-file` 接受普通文件路径，符号链接、目录和设备文件会在扫描前拒绝；需要管道时使用标准输出。
+
 ### 搜索算法参数
 
 - `--heads`：搜索头数量。多个搜索头并行探索不同区域，通过"排斥力"机制避免都跑到同一个局部最优。IPv6 建议 8-16
-- `--beam`：每个搜索头保留的候选前缀数。越大探索越发散
-- `--diversity-weight`：多样性权重（0-1）。越高，搜索头之间越分散
+- `--beam`：每个搜索头保留并评分的候选前缀数上限；持续轮换引入新候选，数值越大单次选择的计算量越大
+- `--diversity-weight`：多样性权重（0-1），显式设置 `0` 可关闭该项惩罚
+- `--seed`：`0` 每次运行生成时间种子；实际种子写入 `--out debug` 的 `stats.seed` 和详细日志。相同输入、种子与反馈顺序可重现采样过程，真实网络和并发响应顺序仍会影响结果
+
+后续细分不会越过 `--max-bits-v4/v6`，单次最多生成 256 个子网；动态树容量默认最多 65,536 个节点，达到上限后继续搜索现有网段。初始输入网段超过该数时仍保留全部输入，并停止进一步扩展。
 
 ### 探测配置
 
@@ -238,6 +249,8 @@ export MCIS_PRIVATE_SOCKS_PASSWORD='your-password'
 
 **自定义测速地址：** 由于 Cloudflare 默认测速端点 `speed.cloudflare.com/__down` 对生成的下载文件大小可能存在限制，可通过 `--download-url` 指定自定义的测速文件地址。
 
+自定义地址必须使用 HTTPS；原端口、转义路径和查询字符串会保留，无路径时请求 `/`。连接目标仍为正在测试的 IP，TLS 验证和 Host 使用原地址的主机信息。非法 URL、用户信息或 fragment 会在扫描前报错；详细日志省略查询字符串。
+
 **指定 `--download-url` 时，默认不限制下载大小**：会下载完整文件直至 EOF，再按实际字节数与耗时计算速度。若需限制流量或时间，可加 `--download-bytes N`（最多读取 N 字节后停止）。未指定自定义 URL 时，仍使用默认 50MB 测速。
 
 ```bash
@@ -267,7 +280,9 @@ export MCIS_PRIVATE_SOCKS_PASSWORD='your-password'
 
 ### DNS 自动上传
 
-搜索完成后，自动将优选 IP 上传到 DNS 服务商。支持 **Cloudflare** 和 **Vercel**。
+搜索完成后，自动将优选 IP 上传到 DNS 服务商。支持 **Cloudflare** 和 **Vercel**。程序先输出或保存扫描结果，再开始 DNS 更新；DNS 失败会返回非零退出码，已保存的结果仍然保留。
+
+上传候选必须同时通过探测和下载测速。程序从全部成功测速结果中按下载速度排序，再应用上传数量上限，包含 `sequential` 模式中后续测速成功的 IP。没有成功候选时跳过更新。
 
 | 参数 | 说明 |
 |------|------|
@@ -276,6 +291,10 @@ export MCIS_PRIVATE_SOCKS_PASSWORD='your-password'
 | `--dns-zone` | Zone ID（Cloudflare）或域名（Vercel），或用环境变量 `CF_ZONE_ID` |
 | `--dns-subdomain` | 子域名前缀（如 `cf` 会创建 `cf.example.com`） |
 | `--dns-upload-count` | 上传 IP 数量（默认与 `--download-top` 相同） |
+| `--dns-timeout` | 整次 DNS 更新的最长时间，默认 `60s`；从结果输出完成后开始计算，包含失败恢复 |
+| `--dns-team-id` | Vercel Team ID，可选；也可使用环境变量 `VERCEL_TEAM_ID` |
+
+更新前会完整读取记录分页，保留已有的相同 IP，先创建并确认缺少的新记录，再删除本次快照中的过期记录。仅处理本次上传涉及的地址族：只上传 IPv4 时保留 AAAA。单次 API 请求最长 `10s`，删除或最终确认失败时，在剩余期限内尝试恢复旧记录及其属性，并保留新增记录；恢复不完整会明确报错。详细行为与测试记录见 [DNS 修复说明](docs/dns-safety.md)。
 
 示例：
 

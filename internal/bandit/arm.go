@@ -33,14 +33,16 @@ type ArmNode struct {
 	BetaNG  float64
 
 	// Raw statistics
-	Samples    int
-	Successes  int
-	Failures   int
-	SumLatency float64
-	SumSqDiff  float64 // Sum of squared differences from mean (for Welford)
+	Samples     int
+	Successes   int
+	Failures    int
+	SumLatency  float64
+	SumSqDiff   float64 // Sum of squared differences from mean (for Welford)
+	latencyMean float64
 
 	// Split state
 	IsSplit bool
+	retired bool
 
 	mu sync.RWMutex
 }
@@ -68,7 +70,9 @@ func NewArmNode(prefix netip.Prefix, parent *ArmNode) *ArmNode {
 
 // Update updates the arm statistics with a new probe result.
 // latencyMS is the observed latency in milliseconds (ignored if success=false).
-// timeoutMS is the timeout value used for failed probes.
+// Failures update only the success probability. The sampler applies its timeout
+// penalty separately; inserting failure pseudo-latencies here double-counts it.
+// The last argument is retained for callers using the previous API.
 func (a *ArmNode) Update(success bool, latencyMS float64, timeoutMS float64) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -79,43 +83,24 @@ func (a *ArmNode) Update(success bool, latencyMS float64, timeoutMS float64) {
 		a.Successes++
 		a.Alpha++
 
-		// Update Normal-Gamma posterior using Bayesian update
-		// See: https://www.cs.ubc.ca/~murphyk/Papers/bayesGauss.pdf
+		// Sequential Normal-Gamma update, including the first observation.
+		// beta' = beta + lambda/(2*(lambda+1)) * (x-mu)^2.
 		oldMu := a.Mu
 		oldLambda := a.Lambda
-
-		// Update precision-weighted mean
+		delta := latencyMS - oldMu
 		a.Lambda = oldLambda + 1
-		a.Mu = (oldLambda*oldMu + latencyMS) / a.Lambda
+		a.Mu = oldMu + delta/a.Lambda
+		a.AlphaNG += 0.5
+		a.BetaNG += 0.5 * oldLambda / a.Lambda * delta * delta
 
-		// Update sum of squared differences (for variance estimation)
+		// Raw sample variance uses the empirical mean, without prior weights.
 		a.SumLatency += latencyMS
-		if a.Successes > 1 {
-			// Welford's online algorithm for variance with precision weighting
-			// For precision-weighted mean, we need to include the weight adjustment factor
-			delta := latencyMS - oldMu
-			a.SumSqDiff += delta * (latencyMS - a.Mu) * oldLambda / a.Lambda
-		}
-
-		// Update Gamma parameters for precision
-		if a.Successes > 1 {
-			a.AlphaNG += 0.5
-			a.BetaNG += 0.5 * (latencyMS - oldMu) * (latencyMS - a.Mu) * oldLambda / a.Lambda
-		}
+		delta = latencyMS - a.latencyMean
+		a.latencyMean += delta / float64(a.Successes)
+		a.SumSqDiff += delta * (latencyMS - a.latencyMean)
 	} else {
 		a.Failures++
 		a.Beta++
-
-		// For failed probes, we use the timeout as a pessimistic latency estimate
-		// but with lower weight to avoid dominating the posterior
-		penaltyLatency := timeoutMS * 2
-		oldMu := a.Mu
-		oldLambda := a.Lambda
-
-		// Weaker update for failures (0.5 weight)
-		weight := 0.5
-		a.Lambda = oldLambda + weight
-		a.Mu = (oldLambda*oldMu + weight*penaltyLatency) / a.Lambda
 	}
 }
 
@@ -169,7 +154,7 @@ func (a *ArmNode) CanSplit(minSamples int, maxBitsV4, maxBitsV6 int) bool {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
 
-	if a.IsSplit {
+	if a.IsSplit || a.retired {
 		return false
 	}
 	if a.Samples < minSamples {
@@ -181,6 +166,12 @@ func (a *ArmNode) CanSplit(minSamples int, maxBitsV4, maxBitsV6 int) bool {
 		return bits < maxBitsV4
 	}
 	return bits < maxBitsV6
+}
+
+func (a *ArmNode) selectable() bool {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return !a.IsSplit && !a.retired
 }
 
 // InformationGain estimates the potential information gain from splitting this arm.

@@ -3,7 +3,6 @@ package probe
 import (
 	"context"
 	"crypto/tls"
-	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -11,6 +10,7 @@ import (
 	"net/http/httptrace"
 	"net/netip"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -19,8 +19,9 @@ type Config struct {
 	SNI         string
 	HostHeader  string
 	Path        string
-	Rounds      int // 总测试次数，默认6
-	SkipFirst   int // 跳过前N次，默认1（跳过第1次握手）
+	Mode        string // auto (default): validate /cdn-cgi/trace; trace: always validate; http: generic 2xx
+	Rounds      int    // 总测试次数，默认6
+	SkipFirst   int    // 跳过前N次，默认1（跳过第1次握手）
 	DialContext DialContextFunc
 }
 
@@ -38,6 +39,7 @@ type Result struct {
 	TotalMS   int64             `json:"total_ms"`
 	Trace     map[string]string `json:"trace,omitempty"`
 	When      time.Time         `json:"when"`
+	Requests  int               `json:"requests"` // HTTP attempts, including failed connection attempts.
 }
 
 type Prober struct {
@@ -68,7 +70,8 @@ func NewProber(cfg Config) *Prober {
 
 	transport := &http.Transport{
 		Proxy:                 nil, // critical: ignore HTTP(S)_PROXY and NO_PROXY env vars
-		DialContext:           dialContext,
+		DisableCompression:    true,
+		DialContext:           trackCandidateConnections(dialContext),
 		ForceAttemptHTTP2:     true,
 		MaxIdleConns:          1024,
 		MaxIdleConnsPerHost:   256,
@@ -81,17 +84,20 @@ func NewProber(cfg Config) *Prober {
 		},
 	}
 	client := &http.Client{
-		Transport: transport,
-		Timeout:   cfg.Timeout,
+		Transport:     transport,
+		Timeout:       cfg.Timeout,
+		CheckRedirect: rejectRedirect,
 	}
 
 	return &Prober{cfg: cfg, client: client}
 }
 
+func (p *Prober) Close() { p.client.CloseIdleConnections() }
+
 // probeOnce performs a single HTTP probe request.
-func (p *Prober) probeOnce(ctx context.Context, ip netip.Addr) Result {
+func (p *Prober) probeOnce(ctx context.Context, ip netip.Addr) (res Result) {
 	start := time.Now()
-	res := Result{
+	res = Result{
 		IP:   ip,
 		When: start,
 	}
@@ -105,31 +111,53 @@ func (p *Prober) probeOnce(ctx context.Context, ip netip.Addr) Result {
 	url := "https://" + targetHost + p.cfg.Path
 
 	var (
+		timingMu     sync.Mutex
 		connectStart time.Time
 		tlsStart     time.Time
 		gotFirstByte time.Time
 		connectDur   time.Duration
 		tlsDur       time.Duration
 	)
+	// Trace callbacks may finish after Do returns on cancellation.
+	defer func() {
+		timingMu.Lock()
+		defer timingMu.Unlock()
+		res.TotalMS = time.Since(start).Milliseconds()
+		res.ConnectMS = connectDur.Milliseconds()
+		res.TLSMS = tlsDur.Milliseconds()
+		if !gotFirstByte.IsZero() {
+			res.TTFBMS = gotFirstByte.Sub(start).Milliseconds()
+		}
+	}()
 
 	trace := &httptrace.ClientTrace{
 		ConnectStart: func(network, addr string) {
+			timingMu.Lock()
+			defer timingMu.Unlock()
 			connectStart = time.Now()
 		},
 		ConnectDone: func(network, addr string, err error) {
+			timingMu.Lock()
+			defer timingMu.Unlock()
 			if !connectStart.IsZero() {
 				connectDur = time.Since(connectStart)
 			}
 		},
 		TLSHandshakeStart: func() {
+			timingMu.Lock()
+			defer timingMu.Unlock()
 			tlsStart = time.Now()
 		},
 		TLSHandshakeDone: func(state tls.ConnectionState, err error) {
+			timingMu.Lock()
+			defer timingMu.Unlock()
 			if !tlsStart.IsZero() {
 				tlsDur = time.Since(tlsStart)
 			}
 		},
 		GotFirstResponseByte: func() {
+			timingMu.Lock()
+			defer timingMu.Unlock()
 			gotFirstByte = time.Now()
 		},
 	}
@@ -145,53 +173,76 @@ func (p *Prober) probeOnce(ctx context.Context, ip netip.Addr) Result {
 	}
 	req.Header.Set("User-Agent", "mcis/0.1")
 	req.Header.Set("Accept", "text/plain")
+	req.Header.Set("Accept-Encoding", "identity")
+	if p.cfg.Mode != "" && p.cfg.Mode != "auto" && p.cfg.Mode != "trace" && p.cfg.Mode != "http" {
+		res.Error = "invalid_probe_mode"
+		return res
+	}
 
+	res.Requests = 1
 	httpRes, err := p.client.Do(req)
 	if err != nil {
-		// Normalize common context timeout.
-		if errors.Is(err, context.DeadlineExceeded) {
-			res.Error = "timeout"
-		} else {
-			res.Error = err.Error()
-		}
-		res.TotalMS = time.Since(start).Milliseconds()
-		res.ConnectMS = connectDur.Milliseconds()
-		res.TLSMS = tlsDur.Milliseconds()
-		if !gotFirstByte.IsZero() {
-			res.TTFBMS = gotFirstByte.Sub(start).Milliseconds()
-		}
+		res.Error = requestError(ctx, err)
 		return res
 	}
 	defer func() { _ = httpRes.Body.Close() }()
 
-	body, _ := io.ReadAll(io.LimitReader(httpRes.Body, 64*1024))
 	res.Status = httpRes.StatusCode
-	res.ConnectMS = connectDur.Milliseconds()
-	res.TLSMS = tlsDur.Milliseconds()
-	if !gotFirstByte.IsZero() {
-		res.TTFBMS = gotFirstByte.Sub(start).Milliseconds()
+	if httpRes.StatusCode >= 300 && httpRes.StatusCode < 400 {
+		res.Error = fmt.Sprintf("redirect_%d", httpRes.StatusCode)
+		return res
 	}
-	res.TotalMS = time.Since(start).Milliseconds()
-
-	if httpRes.StatusCode >= 200 && httpRes.StatusCode < 300 {
-		res.OK = true
-		res.Trace = parseTrace(string(body))
-	} else {
-		res.OK = false
+	if httpRes.StatusCode < 200 || httpRes.StatusCode >= 300 {
 		res.Error = fmt.Sprintf("http_status_%d", httpRes.StatusCode)
+		return res
 	}
+	body, err := io.ReadAll(io.LimitReader(httpRes.Body, maxProbeBodyBytes+1))
+	if err != nil {
+		res.Error = requestError(ctx, err)
+		return res
+	}
+	if ctx.Err() != nil {
+		res.Error = requestError(ctx, ctx.Err())
+		return res
+	}
+	if len(body) > maxProbeBodyBytes {
+		res.Error = "response_too_large"
+		return res
+	}
+	if httpRes.ContentLength > int64(len(body)) {
+		res.Error = "incomplete_response"
+		return res
+	}
+	res.Trace = parseTrace(string(body))
+	if requiresTrace(p.cfg) && !validTrace(res.Trace) {
+		res.Error = "invalid_trace"
+		return res
+	}
+	res.OK = true
 	return res
 }
 
 // ProbeHTTPTrace probes https://<ip>/<path> with SNI/HostHeader.
 // This is a convenience wrapper that calls probeOnce for backward compatibility.
 func (p *Prober) ProbeHTTPTrace(ctx context.Context, ip netip.Addr) Result {
+	ctx, closeConnections := withCandidateConnections(ctx)
+	defer func() {
+		closeConnections()
+		p.Close()
+	}()
 	return p.probeOnce(ctx, ip)
 }
 
 // ProbeHTTPTraceMulti performs multiple probes and returns the average of rounds after skipping the first N.
 // This avoids the TCP/TLS handshake overhead in the first request and provides more stable latency measurements.
 func (p *Prober) ProbeHTTPTraceMulti(ctx context.Context, ip netip.Addr) Result {
+	// A worker never revisits a completed candidate. Reuse its connection across
+	// the rounds, then release it on success, failure or cancellation.
+	ctx, closeConnections := withCandidateConnections(ctx)
+	defer func() {
+		closeConnections()
+		p.Close()
+	}()
 	rounds := p.cfg.Rounds
 	if rounds <= 0 {
 		rounds = 6
@@ -202,23 +253,29 @@ func (p *Prober) ProbeHTTPTraceMulti(ctx context.Context, ip netip.Addr) Result 
 	}
 
 	var results []Result
+	requests := 0
 	for i := 0; i < rounds; i++ {
 		r := p.probeOnce(ctx, ip)
+		requests += r.Requests
 		results = append(results, r)
 		// If any round fails, return the failure immediately
 		if !r.OK {
+			r.Requests = requests
 			return r
 		}
 	}
 
 	// Skip the first N rounds (which include handshake overhead) and calculate average
 	if len(results) <= skipFirst {
-		// If we skipped all rounds, return the last one
-		return results[len(results)-1]
+		last := results[len(results)-1]
+		last.Requests = requests
+		return last
 	}
 
 	validResults := results[skipFirst:]
-	return calculateAverage(validResults, ip)
+	result := calculateAverage(validResults, ip)
+	result.Requests = requests
+	return result
 }
 
 // calculateAverage computes the average of multiple probe results.

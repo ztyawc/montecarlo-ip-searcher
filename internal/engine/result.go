@@ -56,7 +56,19 @@ type TopResult struct {
 
 // Response holds the complete search response.
 type Response struct {
-	Top []TopResult `json:"top"`
+	Top   []TopResult `json:"top"`
+	Stats RunStats    `json:"stats"`
+}
+
+type RunStats struct {
+	Seed            int64 `json:"seed"`
+	Budget          int   `json:"budget"`
+	UniqueIPs       int64 `json:"unique_ips"`
+	Completed       int64 `json:"completed"`
+	Successful      int64 `json:"successful"`
+	Failed          int64 `json:"failed"`
+	Exhausted       bool  `json:"exhausted"`
+	RequestAttempts int64 `json:"request_attempts"`
 }
 
 // topNHeap is a max-heap of TopResult ordered by ScoreMS.
@@ -111,12 +123,17 @@ func (c *TopNCollector) Consider(r TopResult) {
 
 	// Check for duplicate IP
 	if idx, exists := c.ipSeen[r.IP]; exists {
-		// Only update if new score is better
-		if r.ScoreMS < c.heap.items[idx].ScoreMS {
+		// Never keep a stale lucky minimum if a caller explicitly rechecks an IP.
+		if !r.OK {
+			heap.Remove(c.heap, idx)
+		} else {
 			c.heap.items[idx] = r
 			heap.Fix(c.heap, idx)
-			c.rebuildIPMap()
 		}
+		c.rebuildIPMap()
+		return
+	}
+	if !r.OK || !r.IP.IsValid() {
 		return
 	}
 
