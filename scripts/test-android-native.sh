@@ -19,11 +19,13 @@ javac --release 17 -cp "$classpath" -d "$test_output" \
   android-app/app/src/main/java/com/ztyawc/mcis/RunSession.java \
   android-app/app/src/main/java/com/ztyawc/mcis/ScanResults.java \
   flutter-app/android/app/src/main/java/com/ztyawc/mcis/ScanDiagnostics.java \
+  flutter-app/android/app/src/main/java/com/ztyawc/mcis/ScanHistoryStore.java \
   flutter-app/android/app/src/main/java/com/ztyawc/mcis/NativeScanner.java \
   android-app/tests/com/ztyawc/mcis/RunSessionTest.java \
   android-app/tests/com/ztyawc/mcis/ScanResultsTest.java \
   flutter-app/android/tests/com/ztyawc/mcis/NativeConfigTest.java \
-  flutter-app/android/tests/com/ztyawc/mcis/ScanDiagnosticsTest.java
-for test_class in RunSessionTest ScanResultsTest NativeConfigTest ScanDiagnosticsTest; do
+  flutter-app/android/tests/com/ztyawc/mcis/ScanDiagnosticsTest.java \
+  flutter-app/android/tests/com/ztyawc/mcis/ScanHistoryStoreTest.java
+for test_class in RunSessionTest ScanResultsTest NativeConfigTest ScanDiagnosticsTest ScanHistoryStoreTest; do
   java -cp "$test_output:$classpath" "com.ztyawc.mcis.$test_class"
 done

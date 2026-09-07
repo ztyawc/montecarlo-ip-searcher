@@ -29,6 +29,9 @@ public final class FlutterMainActivity extends FlutterActivity {
                             case "start": scanner.start((Map<?, ?>) call.arguments); result.success(null); break;
                             case "stop": scanner.stop(); result.success(null); break;
                             case "snapshot": result.success(scanner.snapshot()); break;
+                            case "history": scanner.history(result); break;
+                            case "historyEntry": scanner.historyEntry((Map<?, ?>) call.arguments, result); break;
+                            case "deleteHistory": scanner.deleteHistory((Map<?, ?>) call.arguments, result); break;
                             default: result.notImplemented();
                         }
                     } catch (Exception error) {
