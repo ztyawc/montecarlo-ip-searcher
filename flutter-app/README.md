@@ -10,6 +10,8 @@ Flutter＋flutter_miuix 界面，通过 Android 平台通道调用 Go 扫描核�
 
 2026-09-07 审计第二、三批修复已接入：诊断统计先从原文解析，再对展示日志脱敏；异常数字不会中断主线程，关闭代理时不会把残留密码传入新任务。Go 核心同步修复下载地址、参数校验及搜索算法，见 [本批修复说明](../docs/reliability-search-fixes.md)。这里的审计批次与此前规划的后台扫描等功能阶段分别记录。
 
+正式安装包从 [本仓库 Release](https://github.com/ztyawc/montecarlo-ip-searcher/releases/latest) 下载，选择 `android-arm64-v8a.apk`。发布工作流会在构建后单独正式签名并验证，未签名的本机构建产物不会作为正式 APK 上传。后续更新沿用同一签名；不同签名的历史测试版不能直接覆盖安装。维护者配置见 [发布说明](../docs/releases.md)。
+
 ## 构建
 
 使用 Flutter **3.47.2**（Dart **3.13.2**）、Go **1.25.5 或更高版本**、完整 JDK **17**、Android SDK Platform **36**、Build Tools **36.0.0** 和 NDK **28.2.13676358**。目标 SDK 保持 35。
