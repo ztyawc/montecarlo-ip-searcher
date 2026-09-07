@@ -4,6 +4,12 @@ import 'dart:convert';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 
+import 'history.dart';
+import 'scan_result.dart';
+
+export 'history.dart';
+export 'scan_result.dart';
+
 const defaultSettings = <String, Object>{
   'ip_version': 0,
   'host': 'www.cloudflare.com',
@@ -39,6 +45,9 @@ abstract class ScanBridge {
   Future<void> save(Map<String, Object> settings);
   Future<void> start(Map<String, Object> settings);
   Future<void> stop();
+  Future<Map<String, dynamic>> history();
+  Future<Map<String, dynamic>> historyEntry(String id);
+  Future<void> deleteHistory(String id);
 }
 
 class AndroidScanBridge implements ScanBridge {
@@ -64,21 +73,18 @@ class AndroidScanBridge implements ScanBridge {
       _control.invokeMethod('start', settings);
   @override
   Future<void> stop() => _control.invokeMethod('stop');
-}
-
-class ScanResult {
-  ScanResult(Map value) : data = Map<String, dynamic>.from(value);
-  final Map<String, dynamic> data;
-  String get ip => data['ip'] as String? ?? '';
-  String get colo => (data['trace'] as Map?)?['colo'] as String? ?? '—';
-  double get latency => (data['score_ms'] as num?)?.toDouble() ?? 0;
-  bool get downloadOk => data['download_ok'] == true;
-  double get mbps => (data['download_mbps'] as num?)?.toDouble() ?? 0;
-  String get speedLabel => downloadOk
-      ? '${mbps.toStringAsFixed(2)} Mbps'
-      : data['download_error'] != null
-      ? '测速失败'
-      : '未测速';
+  @override
+  Future<Map<String, dynamic>> history() async => Map<String, dynamic>.from(
+    await _control.invokeMethod<Map>('history') ?? {},
+  );
+  @override
+  Future<Map<String, dynamic>> historyEntry(String id) async =>
+      Map<String, dynamic>.from(
+        await _control.invokeMethod<Map>('historyEntry', {'id': id}) ?? {},
+      );
+  @override
+  Future<void> deleteHistory(String id) =>
+      _control.invokeMethod('deleteHistory', {'id': id});
 }
 
 class ScanController extends ChangeNotifier {
@@ -93,6 +99,19 @@ class ScanController extends ChangeNotifier {
   List<ScanResult> results = [];
   List<String> logs = [];
   Map<String, dynamic> stats = {};
+  List<ScanHistorySummary> history = [];
+  ScanHistoryEntry? selectedHistory;
+  bool historyLoading = false;
+  bool historyEntryLoading = false;
+  bool historyDeleting = false;
+  String historyError = '';
+  int historyLimit = 50;
+  String _nativeHistoryError = '', _historyRequestError = '';
+  int _historyRevision = -1, _historySelectionSerial = 0;
+  String? _loadingHistoryId, _deletingHistoryId;
+  bool _refreshHistoryAgain = false;
+  Future<void>? _historyRefresh;
+  List<ScanResult> get displayedResults => selectedHistory?.results ?? results;
   bool get running =>
       _starting ||
       ['preparing', 'scanning', 'downloading', 'stopping'].contains(status);
@@ -112,6 +131,7 @@ class ScanController extends ChangeNotifier {
   bool enabled(String key) => values[key] == true;
 
   Future<void> initialize() async {
+    final restoreSerial = _historySelectionSerial;
     try {
       final saved = await bridge.settings();
       if (_disposed) return;
@@ -145,12 +165,24 @@ class ScanController extends ChangeNotifier {
     } catch (e) {
       reportError('无法连接扫描核心：${_message(e)}');
     }
+    if (!ready || _disposed) return;
+    await refreshHistory();
+    if (!_disposed &&
+        restoreSerial == _historySelectionSerial &&
+        runId == 0 &&
+        status == 'idle' &&
+        !running &&
+        results.isEmpty &&
+        history.isNotEmpty) {
+      await selectHistory(history.first.id);
+    }
   }
 
   void applySnapshot(Map<String, dynamic> data) {
     if (_disposed) return;
     final incomingId = (data['runId'] as num?)?.toInt() ?? 0;
     if (incomingId < runId) return;
+    if (incomingId > runId) _clearHistorySelection();
     runId = incomingId;
     status = data['status'] as String? ?? 'idle';
     error = data['error'] as String? ?? '';
@@ -163,7 +195,141 @@ class ScanController extends ChangeNotifier {
         .toList();
     logs = (data['logs'] as List? ?? []).whereType<String>().toList();
     stats = Map<String, dynamic>.from(data['stats'] as Map? ?? {});
+    if (data.containsKey('historyError')) {
+      _nativeHistoryError = data['historyError'] as String? ?? '';
+      _updateHistoryError();
+    }
+    final revision = (data['historyRevision'] as num?)?.toInt() ?? 0;
+    final historyChanged = revision != _historyRevision;
+    _historyRevision = revision;
     notifyListeners();
+    if (ready && historyChanged) unawaited(refreshHistory());
+  }
+
+  Future<void> refreshHistory() {
+    if (_disposed) return Future<void>.value();
+    _refreshHistoryAgain = true;
+    if (_historyRefresh != null) return _historyRefresh!;
+    final completion = Completer<void>();
+    _historyRefresh = completion.future;
+    unawaited(_readHistory(completion));
+    return completion.future;
+  }
+
+  Future<void> _readHistory(Completer<void> completion) async {
+    historyLoading = true;
+    notifyListeners();
+    try {
+      while (_refreshHistoryAgain && !_disposed) {
+        _refreshHistoryAgain = false;
+        try {
+          final data = await bridge.history();
+          if (_disposed) return;
+          final entries = data['entries'];
+          if (entries is! List || entries.length > 50) {
+            throw const FormatException('历史记录列表无效');
+          }
+          final loaded = entries.map((entry) {
+            if (entry is! Map) throw const FormatException('历史记录内容无效');
+            return ScanHistorySummary.fromMap(entry);
+          }).toList();
+          if (loaded.map((entry) => entry.id).toSet().length != loaded.length) {
+            throw const FormatException('历史记录标识重复');
+          }
+          history = List.unmodifiable(loaded);
+          final limit = data['limit'];
+          historyLimit = limit is int && limit > 0 && limit <= 50 ? limit : 50;
+          _historyRequestError = '';
+        } catch (e) {
+          if (!_disposed) _historyRequestError = '读取历史失败：${_message(e)}';
+        }
+        _updateHistoryError();
+      }
+    } finally {
+      _historyRefresh = null;
+      if (!_disposed) {
+        historyLoading = false;
+        notifyListeners();
+      }
+      completion.complete();
+    }
+  }
+
+  Future<void> selectHistory(String id) async {
+    if (_disposed || id == _deletingHistoryId) return;
+    final serial = ++_historySelectionSerial;
+    _loadingHistoryId = id;
+    historyEntryLoading = true;
+    _historyRequestError = '';
+    _updateHistoryError();
+    notifyListeners();
+    try {
+      final data = await bridge.historyEntry(id);
+      if (_disposed || serial != _historySelectionSerial) return;
+      final entry = ScanHistoryEntry.fromMap(data);
+      if (entry.id != id) throw const FormatException('读取到的历史记录不匹配');
+      selectedHistory = entry;
+    } catch (e) {
+      if (!_disposed && serial == _historySelectionSerial) {
+        _historyRequestError = '打开历史失败：${_message(e)}';
+        _updateHistoryError();
+      }
+    } finally {
+      if (!_disposed && serial == _historySelectionSerial) {
+        _loadingHistoryId = null;
+        historyEntryLoading = false;
+        notifyListeners();
+      }
+    }
+  }
+
+  void _clearHistorySelection() {
+    _historySelectionSerial++;
+    selectedHistory = null;
+    _loadingHistoryId = null;
+    historyEntryLoading = false;
+  }
+
+  void showCurrentResults() {
+    if (_disposed) return;
+    _clearHistorySelection();
+    _historyRequestError = '';
+    _updateHistoryError();
+    notifyListeners();
+  }
+
+  Future<void> deleteHistory(String id) async {
+    if (_disposed || historyDeleting) return;
+    historyDeleting = true;
+    _deletingHistoryId = id;
+    if (_loadingHistoryId == id) {
+      _historySelectionSerial++;
+      _loadingHistoryId = null;
+      historyEntryLoading = false;
+    }
+    notifyListeners();
+    try {
+      await bridge.deleteHistory(id);
+      if (_disposed) return;
+      if (selectedHistory?.id == id) _clearHistorySelection();
+      _historyRequestError = '';
+      await refreshHistory();
+    } catch (e) {
+      if (!_disposed) _historyRequestError = '删除历史失败：${_message(e)}';
+    } finally {
+      if (!_disposed) {
+        historyDeleting = false;
+        _deletingHistoryId = null;
+        _updateHistoryError();
+        notifyListeners();
+      }
+    }
+  }
+
+  void _updateHistoryError() {
+    historyError = _historyRequestError.isNotEmpty
+        ? _historyRequestError
+        : _nativeHistoryError;
   }
 
   void setValue(String key, Object value) {
@@ -280,6 +446,7 @@ class ScanController extends ChangeNotifier {
       return;
     }
     _starting = true;
+    _clearHistorySelection();
     error = '';
     notifyListeners();
     try {

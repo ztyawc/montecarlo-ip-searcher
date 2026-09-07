@@ -1,10 +1,10 @@
 # 源码同步与构建
 
-本项目包含 MCIS Go 命令行工具、Flutter＋flutter_miuix Android 客户端和旧 Java Android 客户端，以及已完成的可靠性修复、审计三批修复和配套测试。后台扫描、结果持久化等后续功能尚未实现。
+本项目包含 MCIS Go 命令行工具、Flutter＋flutter_miuix Android 客户端和旧 Java Android 客户端，以及已完成的可靠性修复、审计三批修复和配套测试。Flutter Android 已支持本机结果保存与扫描历史；扫描期间仍需保持前台。
 
 源码中的下列目录需要保持同级：
 
-- `flutter-app/`：Flutter Android 客户端，版本 `0.4.0+4`。
+- `flutter-app/`：Flutter Android 客户端，版本 `0.4.1+5`。
 - `android-app/`：Java Android 客户端，版本 `0.3.1-android.3`；同时提供两端共用的 RunSession 和图标资源。
 - `cmd/`、`internal/`：Go 命令行与搜索核心。
 - `go.mod`、`go.sum`、`ipv4cidr.txt`、`ipv6cidr.txt`、`LICENSE`、`readme.md`。
@@ -44,5 +44,6 @@ git diff --stat
 
 - [首批 DNS 修复](docs/dns-safety.md)
 - [审计第二、三批修复及实测](docs/reliability-search-fixes.md)
+- [Android 结果保存与历史记录](docs/android-history.md)
 - [开发环境验证](docs/development-environment.md)
 - [2026-09-06 源码交付历史记录](docs/source-delivery.md)

@@ -21,6 +21,13 @@ class FakeBridge implements ScanBridge {
   @override
   Future<Map<String, dynamic>> snapshot() async => state;
   @override
+  Future<Map<String, dynamic>> history() async => {'entries': [], 'limit': 50};
+  @override
+  Future<Map<String, dynamic>> historyEntry(String id) async =>
+      throw StateError('History entry not found');
+  @override
+  Future<void> deleteHistory(String id) async {}
+  @override
   Future<void> save(Map<String, Object> settings) async {
     saved = settings;
   }

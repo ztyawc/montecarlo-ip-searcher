@@ -76,7 +76,9 @@ class ScanShell extends StatefulWidget {
 class _ScanShellState extends State<ScanShell> {
   int page = 0;
   bool showLogs = false;
+  bool showHistory = false;
   ScanResult? detail;
+  ScanHistorySummary? pendingDelete;
   final snacks = MiuixSnackbarHostState();
   ScanController get scan => widget.controller;
   static const titles = ['优选', '结果', '设置'];
@@ -86,8 +88,56 @@ class _ScanShellState extends State<ScanShell> {
     setState(() {
       page = index;
       showLogs = false;
+      showHistory = false;
       detail = null;
     });
+  }
+
+  void goBack() {
+    if (pendingDelete != null) {
+      setState(() => pendingDelete = null);
+    } else if (detail != null) {
+      setState(() => detail = null);
+    } else if (showLogs) {
+      setState(() => showLogs = false);
+    } else if (showHistory) {
+      showCurrentResults();
+    } else if (page == 1 && scan.selectedHistory != null) {
+      setState(() => showHistory = true);
+    } else {
+      navigate(0);
+    }
+  }
+
+  void showCurrentResults() {
+    scan.showCurrentResults();
+    setState(() {
+      page = 1;
+      showHistory = false;
+      detail = null;
+    });
+  }
+
+  void openHistory() {
+    FocusManager.instance.primaryFocus?.unfocus();
+    setState(() => showHistory = true);
+    scan.refreshHistory();
+  }
+
+  Future<void> openHistoryEntry(ScanHistorySummary entry) async {
+    await scan.selectHistory(entry.id);
+    if (!mounted || scan.selectedHistory?.id != entry.id) return;
+    setState(() => showHistory = false);
+  }
+
+  Future<void> confirmDelete() async {
+    final entry = pendingDelete;
+    if (entry == null || scan.historyDeleting) return;
+    setState(() => pendingDelete = null);
+    await scan.deleteHistory(entry.id);
+    if (mounted && !scan.history.any((item) => item.id == entry.id)) {
+      snacks.showSnackbar('已删除记录');
+    }
   }
 
   Future<void> copy(String value) async {
@@ -105,6 +155,8 @@ class _ScanShellState extends State<ScanShell> {
   Widget build(BuildContext context) {
     final colors = MiuixTheme.of(context).colors;
     final dark = Theme.of(context).brightness == Brightness.dark;
+    final historyDetail =
+        page == 1 && !showHistory && scan.selectedHistory != null;
     return AnnotatedRegion<SystemUiOverlayStyle>(
       value: (dark ? SystemUiOverlayStyle.light : SystemUiOverlayStyle.dark)
           .copyWith(
@@ -112,31 +164,42 @@ class _ScanShellState extends State<ScanShell> {
             systemNavigationBarColor: Colors.transparent,
           ),
       child: PopScope(
-        canPop: detail == null && !showLogs && page == 0,
+        canPop:
+            detail == null &&
+            pendingDelete == null &&
+            !showLogs &&
+            !showHistory &&
+            page == 0,
         onPopInvokedWithResult: (didPop, result) {
           if (didPop) return;
-          setState(() {
-            if (detail != null) {
-              detail = null;
-            } else if (showLogs) {
-              showLogs = false;
-            } else {
-              page = 0;
-            }
-          });
+          goBack();
         },
         child: MiuixScaffold(
           topBar: MiuixSmallTopAppBar(
-            title: showLogs ? '运行日志' : 'MCIS',
-            navigationIcon: showLogs
+            title: showLogs
+                ? '运行日志'
+                : showHistory
+                ? '历史记录'
+                : historyDetail
+                ? '历史结果'
+                : 'MCIS',
+            navigationIcon: showLogs || showHistory || historyDetail
                 ? IconButton(
-                    onPressed: () => setState(() => showLogs = false),
+                    onPressed: goBack,
                     icon: const Icon(Icons.arrow_back_rounded),
                     tooltip: '返回',
                   )
                 : null,
             actions: [
-              if (!showLogs)
+              if (showHistory && !showLogs)
+                IconButton(
+                  onPressed: scan.historyLoading || scan.historyDeleting
+                      ? null
+                      : scan.refreshHistory,
+                  icon: const Icon(Icons.refresh_rounded),
+                  tooltip: '刷新历史记录',
+                ),
+              if (!showLogs && !showHistory && !historyDetail)
                 IconButton(
                   onPressed: () => setState(() => showLogs = true),
                   icon: const Icon(Icons.receipt_long_rounded, size: 23),
@@ -174,7 +237,12 @@ class _ScanShellState extends State<ScanShell> {
             ),
             child: Stack(
               children: [
-                if (showLogs) _logs(padding) else _page(padding),
+                if (showLogs)
+                  _logs(padding)
+                else if (showHistory)
+                  _historyPage(padding)
+                else
+                  _page(padding),
                 MiuixOverlayBottomSheet(
                   show: detail != null,
                   title: 'IP 详情',
@@ -182,6 +250,43 @@ class _ScanShellState extends State<ScanShell> {
                   content: detail == null
                       ? const SizedBox.shrink()
                       : _details(detail!, colors.onSurface),
+                ),
+                MiuixOverlayBottomSheet(
+                  show: pendingDelete != null,
+                  title: '删除这条记录？',
+                  onDismissRequest: () => setState(() => pendingDelete = null),
+                  content: SingleChildScrollView(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.stretch,
+                      children: [
+                        if (pendingDelete != null)
+                          Text(
+                            '${_historyTime(pendingDelete!.startedAt)}\n${pendingDelete!.host}\n删除后无法恢复。正在进行的扫描会继续。',
+                            style: const TextStyle(fontSize: 14, height: 1.6),
+                          ),
+                        const SizedBox(height: 22),
+                        _pair(
+                          MiuixButton(
+                            key: const ValueKey('cancel-delete-history'),
+                            onPressed: () =>
+                                setState(() => pendingDelete = null),
+                            child: const Text('取消'),
+                          ),
+                          MiuixButton(
+                            key: const ValueKey('confirm-delete-history'),
+                            enabled: !scan.historyDeleting,
+                            onPressed: confirmDelete,
+                            child: Text(
+                              '删除记录',
+                              style: TextStyle(
+                                color: Theme.of(context).colorScheme.error,
+                              ),
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
                 ),
               ],
             ),
@@ -198,7 +303,11 @@ class _ScanShellState extends State<ScanShell> {
       _ => _settings(),
     };
     return ListView(
-      key: PageStorageKey('page-$page'),
+      key: PageStorageKey(
+        page == 1
+            ? 'results-${scan.selectedHistory?.id ?? 'current'}'
+            : 'page-$page',
+      ),
       keyboardDismissBehavior: ScrollViewKeyboardDismissBehavior.onDrag,
       padding: padding + const EdgeInsets.fromLTRB(20, 10, 20, 28),
       children: [
@@ -212,7 +321,11 @@ class _ScanShellState extends State<ScanShell> {
         Padding(
           padding: const EdgeInsets.fromLTRB(8, 0, 8, 20),
           child: Text(
-            ['找到更快的连接', '本次扫描的可用 IP', '让每次优选更合适'][page],
+            [
+              '找到更快的连接',
+              scan.selectedHistory == null ? '本次扫描的可用 IP' : '已保存在本机的扫描结果',
+              '让每次优选更合适',
+            ][page],
             style: TextStyle(
               fontSize: 13,
               color: MiuixTheme.of(context).colors.onSurfaceVariantSummary,
@@ -362,6 +475,7 @@ class _ScanShellState extends State<ScanShell> {
         ),
       ),
       if (scan.error.isNotEmpty) _errorCard(),
+      if (scan.historyError.isNotEmpty) _historyErrorCard(),
       _section('扫描目标'),
       MiuixCard(
         cornerRadius: 24,
@@ -448,7 +562,7 @@ class _ScanShellState extends State<ScanShell> {
       ),
       const SizedBox(height: 18),
       Text(
-        '扫描期间请保持应用在前台。结果保留至下次扫描或关闭应用。',
+        '扫描期间请保持应用在前台。结束后的记录自动保存在本机，最多保留 ${scan.historyLimit} 次。',
         style: TextStyle(
           color: c.onSurfaceVariantSummary,
           fontSize: 12,
@@ -474,9 +588,20 @@ class _ScanShellState extends State<ScanShell> {
 
   List<Widget> _results() {
     final c = MiuixTheme.of(context).colors;
+    final history = scan.selectedHistory;
+    final results = scan.displayedResults;
+    final stats = history?.stats ?? scan.stats;
     return [
-      if (scan.error.isNotEmpty) _errorCard(),
-      if (scan.running) ...[
+      _historyLink(),
+      const SizedBox(height: 14),
+      if (scan.historyError.isNotEmpty) _historyErrorCard(),
+      if (scan.historyEntryLoading) _historyLoadingCard('正在读取扫描记录…'),
+      if (history != null) ...[
+        _historyContext(history),
+        const SizedBox(height: 14),
+      ],
+      if (history == null && scan.error.isNotEmpty) _errorCard(),
+      if (history == null && scan.running) ...[
         MiuixCard(
           cornerRadius: 24,
           insideMargin: const EdgeInsets.all(20),
@@ -501,7 +626,7 @@ class _ScanShellState extends State<ScanShell> {
         ),
         const SizedBox(height: 14),
       ],
-      if (scan.results.isEmpty)
+      if (results.isEmpty && !scan.historyEntryLoading)
         MiuixCard(
           cornerRadius: 26,
           insideMargin: const EdgeInsets.symmetric(
@@ -517,7 +642,11 @@ class _ScanShellState extends State<ScanShell> {
               ),
               const SizedBox(height: 24),
               Text(
-                scan.status == 'completed' ? '暂无可用 IP' : '等待一次新的发现',
+                history != null
+                    ? '这次扫描没有可用 IP'
+                    : scan.status == 'completed'
+                    ? '暂无可用 IP'
+                    : '等待一次新的发现',
                 style: const TextStyle(
                   fontSize: 22,
                   fontWeight: FontWeight.w600,
@@ -525,37 +654,38 @@ class _ScanShellState extends State<ScanShell> {
               ),
               const SizedBox(height: 12),
               Text(
-                scan.status == 'completed'
+                history != null
+                    ? '已保留这次扫描的时间、状态和统计信息'
+                    : scan.status == 'completed'
                     ? '检查网络、目标域名和网段后重试'
                     : '开始优选后，在这里查看延迟、机房和下载速度',
                 style: TextStyle(color: c.onSurfaceVariantSummary, height: 1.6),
                 textAlign: TextAlign.center,
               ),
-              const SizedBox(height: 24),
-              MiuixButton(
-                onPressed: () => navigate(0),
-                child: const Text('前往优选'),
-              ),
+              if (history == null) ...[
+                const SizedBox(height: 24),
+                MiuixButton(
+                  onPressed: () => navigate(0),
+                  child: const Text('前往优选'),
+                ),
+              ],
             ],
           ),
         )
-      else ...[
-        Row(
-          children: [
-            Expanded(
-              child: Text(
-                '${scan.results.length} 个优选结果',
-                style: const TextStyle(
-                  fontSize: 15,
-                  fontWeight: FontWeight.w600,
-                ),
-              ),
-            ),
-            MiuixButton(
-              onPressed: () => copy(scan.results.map((r) => r.ip).join('\n')),
+      else if (results.isNotEmpty) ...[
+        _pair(
+          Text(
+            '${results.length} 个优选结果',
+            style: const TextStyle(fontSize: 15, fontWeight: FontWeight.w600),
+          ),
+          Align(
+            alignment: Alignment.centerRight,
+            child: MiuixButton(
+              key: const ValueKey('copy-all-results'),
+              onPressed: () => copy(results.map((r) => r.ip).join('\n')),
               child: const Text('复制全部'),
             ),
-          ],
+          ),
         ),
         const SizedBox(height: 10),
         Text(
@@ -563,15 +693,15 @@ class _ScanShellState extends State<ScanShell> {
           style: TextStyle(fontSize: 12, color: c.onSurfaceVariantSummary),
         ),
         const SizedBox(height: 16),
-        ...scan.results.indexed.map(
+        ...results.indexed.map(
           (entry) => Padding(
             padding: const EdgeInsets.only(bottom: 12),
             child: _resultCard(entry.$2, entry.$1 + 1),
           ),
         ),
       ],
-      if (scan.stats.isNotEmpty) ...[
-        _section('本次统计'),
+      if (stats.isNotEmpty) ...[
+        _section(history == null ? '本次统计' : '这次记录的统计'),
         MiuixCard(
           cornerRadius: 24,
           insideMargin: const EdgeInsets.all(20),
@@ -579,15 +709,286 @@ class _ScanShellState extends State<ScanShell> {
             spacing: 24,
             runSpacing: 18,
             children: [
-              _metric('成功探测', '${scan.stats['successful'] ?? 0}'),
-              _metric('失败探测', '${scan.stats['failed'] ?? 0}'),
-              _metric('请求次数', '${scan.stats['request_attempts'] ?? 0}'),
+              _metric('成功探测', '${stats['successful'] ?? 0}'),
+              _metric('失败探测', '${stats['failed'] ?? 0}'),
+              _metric('请求次数', '${stats['request_attempts'] ?? 0}'),
             ],
           ),
         ),
       ],
     ];
   }
+
+  String _historyTime(DateTime value) {
+    final local = value.toLocal();
+    String two(int number) => number.toString().padLeft(2, '0');
+    return '${local.year}-${two(local.month)}-${two(local.day)} '
+        '${two(local.hour)}:${two(local.minute)}';
+  }
+
+  Widget _historyLink() {
+    final c = MiuixTheme.of(context).colors;
+    return MiuixCard(
+      key: const ValueKey('open-history'),
+      cornerRadius: 24,
+      insideMargin: const EdgeInsets.all(20),
+      onPressed: openHistory,
+      child: Row(
+        children: [
+          Icon(Icons.history_rounded, color: c.primary),
+          const SizedBox(width: 12),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Text(
+                  '历史记录',
+                  style: TextStyle(fontSize: 16, fontWeight: FontWeight.w600),
+                ),
+                const SizedBox(height: 5),
+                Text(
+                  scan.historyLoading
+                      ? '正在读取历史记录…'
+                      : '已保存 ${scan.history.length} 次 · 最多 ${scan.historyLimit} 次',
+                  style: TextStyle(
+                    fontSize: 12,
+                    color: c.onSurfaceVariantSummary,
+                  ),
+                ),
+              ],
+            ),
+          ),
+          Icon(Icons.chevron_right_rounded, color: c.onSurfaceVariantSummary),
+        ],
+      ),
+    );
+  }
+
+  Widget _historyPage(EdgeInsets padding) {
+    final c = MiuixTheme.of(context).colors;
+    return ListView(
+      key: const PageStorageKey('history-list'),
+      padding: padding + const EdgeInsets.fromLTRB(20, 10, 20, 28),
+      children: [
+        const Padding(
+          padding: EdgeInsets.fromLTRB(8, 0, 8, 8),
+          child: Text(
+            '最近扫描',
+            style: TextStyle(fontSize: 30, fontWeight: FontWeight.w700),
+          ),
+        ),
+        Padding(
+          padding: const EdgeInsets.fromLTRB(8, 0, 8, 20),
+          child: Text(
+            '记录仅保存在本机，自动保留最近 ${scan.historyLimit} 次。点击可查看完整结果。',
+            style: TextStyle(
+              fontSize: 13,
+              height: 1.5,
+              color: c.onSurfaceVariantSummary,
+            ),
+          ),
+        ),
+        MiuixButton(
+          key: const ValueKey('history-show-current'),
+          onPressed: showCurrentResults,
+          child: Text(scan.running ? '查看本次扫描 · ${scan.statusLabel}' : '查看本次扫描'),
+        ),
+        const SizedBox(height: 14),
+        if (scan.historyError.isNotEmpty) _historyErrorCard(),
+        if (scan.historyLoading) _historyLoadingCard('正在读取历史记录…'),
+        if (scan.historyEntryLoading) _historyLoadingCard('正在读取扫描记录…'),
+        if (scan.historyDeleting) _historyLoadingCard('正在删除记录…'),
+        if (!scan.historyLoading &&
+            scan.historyError.isEmpty &&
+            scan.history.isEmpty)
+          MiuixCard(
+            cornerRadius: 24,
+            insideMargin: const EdgeInsets.symmetric(
+              vertical: 40,
+              horizontal: 24,
+            ),
+            child: Column(
+              children: [
+                Icon(Icons.history_rounded, color: c.primary, size: 44),
+                const SizedBox(height: 18),
+                const Text(
+                  '暂无历史记录',
+                  style: TextStyle(fontSize: 20, fontWeight: FontWeight.w600),
+                ),
+                const SizedBox(height: 12),
+                Text(
+                  '扫描结束后会自动保存在这里，重开应用仍可查看。',
+                  textAlign: TextAlign.center,
+                  style: TextStyle(
+                    color: c.onSurfaceVariantSummary,
+                    height: 1.6,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        for (final entry in scan.history)
+          Padding(
+            padding: const EdgeInsets.only(bottom: 12),
+            child: MiuixCard(
+              key: ValueKey('history-${entry.id}'),
+              cornerRadius: 24,
+              insideMargin: const EdgeInsets.fromLTRB(20, 12, 12, 20),
+              onPressed: scan.historyEntryLoading || scan.historyDeleting
+                  ? null
+                  : () => openHistoryEntry(entry),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Row(
+                    children: [
+                      Expanded(
+                        child: Text(
+                          _historyTime(entry.startedAt),
+                          style: const TextStyle(
+                            fontSize: 15,
+                            fontWeight: FontWeight.w600,
+                          ),
+                        ),
+                      ),
+                      _deleteHistoryButton(entry),
+                    ],
+                  ),
+                  const SizedBox(height: 4),
+                  Text(entry.host, style: const TextStyle(fontSize: 15)),
+                  const SizedBox(height: 14),
+                  Wrap(
+                    spacing: 8,
+                    runSpacing: 8,
+                    children: [
+                      _tag('IPv${entry.ipVersion}', c.primary),
+                      _tag(entry.statusLabel, c.onSurfaceVariantSummary),
+                      _tag(
+                        '${entry.resultCount} 个结果',
+                        c.onSurfaceVariantSummary,
+                      ),
+                    ],
+                  ),
+                ],
+              ),
+            ),
+          ),
+      ],
+    );
+  }
+
+  Widget _historyContext(ScanHistoryEntry entry) {
+    final c = MiuixTheme.of(context).colors;
+    return MiuixCard(
+      key: const ValueKey('history-context'),
+      cornerRadius: 24,
+      insideMargin: const EdgeInsets.fromLTRB(20, 12, 12, 20),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              const Expanded(
+                child: Text(
+                  '已保存的扫描',
+                  style: TextStyle(fontSize: 17, fontWeight: FontWeight.w600),
+                ),
+              ),
+              _deleteHistoryButton(entry),
+            ],
+          ),
+          Text(
+            '开始 ${_historyTime(entry.startedAt)}\n结束 ${_historyTime(entry.finishedAt)}',
+            style: TextStyle(
+              fontSize: 13,
+              height: 1.6,
+              color: c.onSurfaceVariantSummary,
+            ),
+          ),
+          const SizedBox(height: 12),
+          Text(entry.host, style: const TextStyle(fontSize: 15)),
+          const SizedBox(height: 12),
+          Wrap(
+            spacing: 8,
+            runSpacing: 8,
+            children: [
+              _tag('IPv${entry.ipVersion}', c.primary),
+              _tag(entry.statusLabel, c.onSurfaceVariantSummary),
+            ],
+          ),
+          const SizedBox(height: 12),
+          Text(
+            '已探测 ${entry.completed} / ${entry.total} 个 IP',
+            style: TextStyle(fontSize: 13, color: c.onSurfaceVariantSummary),
+          ),
+          const SizedBox(height: 16),
+          SizedBox(
+            width: double.infinity,
+            child: MiuixButton(
+              key: const ValueKey('show-current-results'),
+              onPressed: showCurrentResults,
+              child: Text(
+                scan.running ? '查看本次扫描 · ${scan.statusLabel}' : '查看本次扫描',
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _deleteHistoryButton(ScanHistorySummary entry) => IconButton(
+    key: ValueKey('delete-history-${entry.id}'),
+    onPressed: scan.historyDeleting || scan.historyEntryLoading
+        ? null
+        : () => setState(() => pendingDelete = entry),
+    tooltip: '删除这条记录',
+    icon: const Icon(Icons.delete_outline_rounded, size: 21),
+  );
+
+  Widget _historyLoadingCard(String message) => Padding(
+    padding: const EdgeInsets.only(bottom: 14),
+    child: MiuixCard(
+      cornerRadius: 24,
+      insideMargin: const EdgeInsets.all(20),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(message),
+          const SizedBox(height: 12),
+          const MiuixLinearProgressIndicator(),
+        ],
+      ),
+    ),
+  );
+
+  Widget _historyErrorCard() => Padding(
+    padding: const EdgeInsets.only(bottom: 14, top: 14),
+    child: MiuixCard(
+      key: const ValueKey('history-error'),
+      cornerRadius: 20,
+      insideMargin: const EdgeInsets.all(18),
+      colors: MiuixCardColors(
+        color: Theme.of(context).colorScheme.errorContainer,
+        contentColor: Theme.of(context).colorScheme.onErrorContainer,
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const Text('历史记录提示', style: TextStyle(fontWeight: FontWeight.w600)),
+          const SizedBox(height: 8),
+          Text(scan.historyError, style: const TextStyle(height: 1.5)),
+          const SizedBox(height: 12),
+          MiuixButton(
+            key: const ValueKey('retry-history'),
+            enabled: !scan.historyLoading && !scan.historyDeleting,
+            onPressed: scan.refreshHistory,
+            child: const Text('刷新历史'),
+          ),
+        ],
+      ),
+    ),
+  );
 
   Widget _resultCard(ScanResult result, int rank) {
     final c = MiuixTheme.of(context).colors;
@@ -778,7 +1179,7 @@ class _ScanShellState extends State<ScanShell> {
     ),
     const SizedBox(height: 26),
     const Text(
-      'MCIS 0.4.0\nFlutter · flutter_miuix',
+      'MCIS 0.4.1\nFlutter · flutter_miuix',
       textAlign: TextAlign.center,
       style: TextStyle(fontSize: 12, height: 1.8, color: Colors.grey),
     ),

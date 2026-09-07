@@ -1,6 +1,6 @@
 # Release 构建与发布
 
-发布内容为 Windows、Linux、macOS 的 amd64 / arm64 命令行压缩包，以及 Flutter Android arm64-v8a 图形界面 APK。Android 最低版本为 8.0，版本号来自 `flutter-app/pubspec.yaml`；当前为 `0.4.0+4`。旧 Java 客户端保留源码，不同时发布另一份同包名 APK。
+发布内容为 Windows、Linux、macOS 的 amd64 / arm64 命令行压缩包，以及 Flutter Android arm64-v8a 图形界面 APK。Android 最低版本为 8.0，版本号来自 `flutter-app/pubspec.yaml`；当前源码为 `0.4.1+5`。旧 Java 客户端保留源码，不同时发布另一份同包名 APK。
 
 ## 构建环境
 

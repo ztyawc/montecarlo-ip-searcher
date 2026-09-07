@@ -5,6 +5,7 @@ import android.content.SharedPreferences;
 import android.os.Handler;
 import android.os.Looper;
 import io.flutter.plugin.common.EventChannel;
+import io.flutter.plugin.common.MethodChannel;
 import org.json.JSONArray;
 import org.json.JSONObject;
 import java.io.*;
@@ -25,8 +26,22 @@ final class NativeScanner implements EventChannel.StreamHandler, AutoCloseable {
     private final Consumer<Boolean> runningChanged;
     private final Handler main = new Handler(Looper.getMainLooper());
     private final ExecutorService workers = Executors.newFixedThreadPool(3);
-    private EventChannel.EventSink sink;
     private boolean closed;
+    // Shared across Activity recreation, so an old Activity's final save precedes the next one's reads.
+    private static final ExecutorService HISTORY_IO = Executors.newSingleThreadExecutor();
+    private static final Map<String, ScanHistoryStore> HISTORY_STORES = new HashMap<>();
+    private ScanHistoryStore historyStore; // confined to HISTORY_IO
+    private long historyRevision;
+    private enum HistoryErrorKind { READ, SAVE, DELETE }
+    private final Map<HistoryErrorKind, String> historyErrors = new EnumMap<>(HistoryErrorKind.class);
+    private static final String HISTORY_SAVE_FAILURE = "历史记录保存失败，已保留此前记录。";
+    private HistoryRun activeHistory;
+    private boolean checkpointScheduled;
+    private final Runnable checkpoint = () -> {
+        checkpointScheduled = false;
+        if (!closed && activeHistory != null) saveHistory(activeHistory, "interrupted", true);
+    };
+    private EventChannel.EventSink sink;
     private boolean emitScheduled;
     private final Runnable publish = () -> {
         emitScheduled = false;
@@ -46,6 +61,17 @@ final class NativeScanner implements EventChannel.StreamHandler, AutoCloseable {
         // No process survives the activity lifecycle. Remove credentials left by a killed app.
         File[] stale = context.getCacheDir().listFiles((dir, name) -> name.startsWith("private-socks-") && name.endsWith(".json"));
         if (stale != null) for (File file : stale) file.delete();
+        HISTORY_IO.execute(() -> {
+            try {
+                File file = new File(this.context.getFilesDir(), "scan-history-v1.bin");
+                historyStore = HISTORY_STORES.computeIfAbsent(file.getAbsolutePath(), ignored -> new ScanHistoryStore(file));
+                historyStore.load();
+                historyChanged(HistoryErrorKind.READ);
+                if (historyStore.hasFailedFinalSaves()) historyFailed(HistoryErrorKind.SAVE, HISTORY_SAVE_FAILURE);
+            } catch (Exception failure) {
+                historyFailed(HistoryErrorKind.READ, "无法读取历史记录，已保留原文件。仍可正常扫描。");
+            }
+        });
     }
 
     Map<String, Object> settings() {
@@ -73,7 +99,115 @@ final class NativeScanner implements EventChannel.StreamHandler, AutoCloseable {
         value.put("completed", completed); value.put("total", total);
         value.put("results", new ArrayList<>(results)); value.put("logs", new ArrayList<>(logs));
         value.put("stats", new HashMap<>(stats));
+        value.put("historyRevision", historyRevision); value.put("historyError", String.join("\n", historyErrors.values()));
         return value;
+    }
+
+    void history(MethodChannel.Result reply) {
+        historyCall(reply, HistoryErrorKind.READ, "无法读取历史记录，已保留原文件。仍可正常扫描。", () -> {
+            if (historyStore.retryRead()) historyChanged(HistoryErrorKind.READ);
+            Map<String, Object> value = new HashMap<>();
+            value.put("entries", historyStore.summaries()); value.put("limit", ScanHistoryStore.LIMIT);
+            return value;
+        });
+    }
+
+    void historyEntry(Map<?, ?> arguments, MethodChannel.Result reply) {
+        final String id = historyId(arguments);
+        historyCall(reply, HistoryErrorKind.READ, "无法读取这条历史记录，已保留原文件。", () -> historyStore.entry(id));
+    }
+
+    void deleteHistory(Map<?, ?> arguments, MethodChannel.Result reply) {
+        final String id = historyId(arguments);
+        historyCall(reply, HistoryErrorKind.DELETE, "删除历史记录失败，原记录已保留。", () -> {
+            boolean hadFailedFinalSave = historyStore.hasFailedFinalSaves();
+            if (historyStore.delete(id)) {
+                historyChanged(HistoryErrorKind.DELETE);
+                if (hadFailedFinalSave && !historyStore.hasFailedFinalSaves()) clearHistoryError(HistoryErrorKind.SAVE);
+            }
+            return null;
+        });
+    }
+
+    private static String historyId(Map<?, ?> arguments) {
+        Object id = arguments == null ? null : arguments.get("id");
+        if (!(id instanceof String)) throw new IllegalArgumentException("缺少历史记录编号");
+        return (String) id;
+    }
+
+    private interface HistoryCall { Object run() throws Exception; }
+
+    private void historyCall(MethodChannel.Result reply, HistoryErrorKind kind, String message, HistoryCall call) {
+        HISTORY_IO.execute(() -> {
+            try {
+                if (historyStore == null) throw new IOException("历史存储未初始化");
+                Object value = call.run();
+                clearHistoryError(kind);
+                main.post(() -> reply.success(value));
+            } catch (IllegalArgumentException | FileNotFoundException failure) {
+                main.post(() -> reply.error("history", failure.getMessage(), null));
+            } catch (Exception failure) {
+                historyFailed(kind, message);
+                main.post(() -> reply.error("history", message, null));
+            }
+        });
+    }
+
+    private void historyChanged(HistoryErrorKind resolvedError) {
+        main.post(() -> {
+            if (closed) return;
+            historyRevision++;
+            if (resolvedError != null) historyErrors.remove(resolvedError);
+            emit();
+        });
+    }
+
+    private void clearHistoryError(HistoryErrorKind kind) {
+        main.post(() -> { if (!closed && historyErrors.remove(kind) != null) emit(); });
+    }
+
+    private void historyFailed(HistoryErrorKind kind, String message) {
+        main.post(() -> { if (!closed) { historyErrors.put(kind, message); emit(); } });
+    }
+
+    private void saveHistory(HistoryRun run, String finalStatus, boolean pending) {
+        // Rows are immutable after parsing. Copy containers now; sanitize and write on the IO executor.
+        List<Map<String, Object>> rows = new ArrayList<>(results);
+        Map<String, Object> summary = new HashMap<>(stats);
+        int done = completed, count = total;
+        long finishedAt = System.currentTimeMillis();
+        HISTORY_IO.execute(() -> {
+            try {
+                if (historyStore == null) throw new IOException("历史存储未初始化");
+                ScanHistoryStore.Entry entry = ScanHistoryStore.capture(run.id, run.startedAt, finishedAt,
+                        finalStatus, run.ipVersion, run.host, run.budget, done, count, rows, summary);
+                historyStore.save(entry, pending);
+                historyChanged(historyStore.hasFailedFinalSaves() ? null : HistoryErrorKind.SAVE);
+            } catch (Exception failure) {
+                if (!pending && historyStore != null && historyStore.revealFailedFinalSave(run.id)) historyChanged(null);
+                historyFailed(HistoryErrorKind.SAVE, HISTORY_SAVE_FAILURE);
+            }
+        });
+    }
+
+    private void scheduleHistoryCheckpoint() {
+        if (!checkpointScheduled && activeHistory != null) {
+            checkpointScheduled = true;
+            main.postDelayed(checkpoint, 2000);
+        }
+    }
+
+    private void cancelHistoryCheckpoint() {
+        main.removeCallbacks(checkpoint);
+        checkpointScheduled = false;
+    }
+
+    private static final class HistoryRun {
+        final String id = UUID.randomUUID().toString();
+        final long startedAt = System.currentTimeMillis();
+        final int ipVersion, budget;
+        final String host;
+        HistoryRun(Config config) { ipVersion = config.ipv6 ? 6 : 4; budget = config.budget; host = config.s("host"); }
     }
 
     @Override public void onListen(Object arguments, EventChannel.EventSink events) { sink = events; emit(); }
@@ -94,6 +228,8 @@ final class NativeScanner implements EventChannel.StreamHandler, AutoCloseable {
         RunSession session = new RunSession();
         active = session; runId++; status = "preparing"; error = "";
         completed = 0; total = config.budget; results.clear(); logs.clear(); stats.clear();
+        activeHistory = new HistoryRun(config);
+        saveHistory(activeHistory, "interrupted", true);
         runningChanged.accept(true); emit();
         workers.execute(() -> run(session, config));
     }
@@ -163,6 +299,9 @@ final class NativeScanner implements EventChannel.StreamHandler, AutoCloseable {
                 active = null; runningChanged.accept(false);
                 status = session.isStopRequested() ? "stopped" : exitCode == 0 && problem.isEmpty() ? "completed" : "error";
                 if (status.equals("error")) error = problem.isEmpty() ? "扫描失败（退出码 " + exitCode + "），请查看日志" : problem;
+                cancelHistoryCheckpoint();
+                if (activeHistory != null) saveHistory(activeHistory, status, false);
+                activeHistory = null;
                 emit();
             });
         }
@@ -184,7 +323,7 @@ final class NativeScanner implements EventChannel.StreamHandler, AutoCloseable {
                     });
                 } else {
                     Map<String, Object> value = jsonMap(new JSONObject(line));
-                    if (Boolean.TRUE.equals(value.get("ok"))) post(session, () -> results.add(value));
+                    if (Boolean.TRUE.equals(value.get("ok"))) post(session, () -> { results.add(value); scheduleHistoryCheckpoint(); });
                 }
             }
         } catch (Exception e) {
@@ -193,10 +332,14 @@ final class NativeScanner implements EventChannel.StreamHandler, AutoCloseable {
     }
 
     @Override public void close() {
+        cancelHistoryCheckpoint();
+        if (activeHistory != null) saveHistory(activeHistory, "interrupted", false);
+        activeHistory = null;
         closed = true; sink = null;
         main.removeCallbacks(publish); emitScheduled = false;
         if (active != null) { main.removeCallbacks(active.forceStopAction); active.forceStop(); active.close(); active = null; }
         workers.shutdownNow(); runningChanged.accept(false);
+        // HISTORY_IO remains alive to flush this Activity's final snapshot after its destruction.
     }
     private static void closeStream(Closeable stream) { try { stream.close(); } catch (IOException ignored) {} }
     private static String redact(String line, String password) { return ScanDiagnostics.redact(line, password); }

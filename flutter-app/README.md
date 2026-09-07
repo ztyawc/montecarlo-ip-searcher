@@ -1,14 +1,16 @@
-# MCIS Flutter Android 0.4.0
+# MCIS Flutter Android 0.4.1
 
 Flutter＋flutter_miuix 界面，通过 Android 平台通道调用 Go 扫描核心。
 
-- 版本：`0.4.0+4`，包名：`com.ztyawc.mcis`。
+- 版本：`0.4.1+5`，包名：`com.ztyawc.mcis`。
 - Android 8.0 及以上，仅 `arm64-v8a`。
-- 页面：优选、结果、设置、运行日志、IP 详情。
+- 页面：优选、结果、设置、运行日志、IP 详情和扫描历史。
 - 浅色/深色/跟随系统主题；IPv4/IPv6、Colo 筛选、下载测速、私有 SOCKS 0x80/0x82。
-- 保留第一阶段的 HTTP 校验、下载有效性、IP 去重及 RunSession 修复。第二阶段尚未实施。
+- 保留此前的 HTTP 校验、下载有效性、IP 去重及 RunSession 修复；自动保存最近 50 次扫描记录。
 
 2026-09-07 审计第二、三批修复已接入：诊断统计先从原文解析，再对展示日志脱敏；异常数字不会中断主线程，关闭代理时不会把残留密码传入新任务。Go 核心同步修复下载地址、参数校验及搜索算法，见 [本批修复说明](../docs/reliability-search-fixes.md)。这里的审计批次与此前规划的后台扫描等功能阶段分别记录。
+
+0.4.1 新增本机历史记录：重开应用可查看已保存的结果，开始新扫描会保留上一轮。入口在“结果 → 历史记录”，支持查看 IP 详情、复制和确认删除单条记录，见 [历史记录说明](../docs/android-history.md)。
 
 正式安装包从 [本仓库 Release](https://github.com/ztyawc/montecarlo-ip-searcher/releases/latest) 下载，选择 `android-arm64-v8a.apk`。发布工作流会在构建后单独正式签名并验证，未签名的本机构建产物不会作为正式 APK 上传。后续更新沿用同一签名；不同签名的历史测试版不能直接覆盖安装。维护者配置见 [发布说明](../docs/releases.md)。
 
@@ -56,8 +58,10 @@ keyPassword=YOUR_KEY_PASSWORD
 | --- | --- |
 | `lib/main.dart` | miuix 页面与交互 |
 | `lib/scan_controller.dart` | 参数校验、状态、MethodChannel/EventChannel |
+| `lib/history.dart`、`lib/scan_result.dart` | 历史摘要、历史详情与 IP 结果模型 |
 | `android/app/src/main/java/com/ztyawc/mcis/FlutterMainActivity.java` | Flutter 宿主和通道注册 |
 | `android/app/src/main/java/com/ztyawc/mcis/NativeScanner.java` | Go 进程、JSONL 结果、进度与日志 |
+| `android/app/src/main/java/com/ztyawc/mcis/ScanHistoryStore.java` | 本机历史文件、原子保存、保留数量与异常恢复 |
 | `../android-app/app/src/main/java/com/ztyawc/mcis/RunSession.java` | 共用的进程生命周期控制 |
 | `../cmd/mcis/`、`../internal/` | Go CLI 与扫描核心 |
 | `test/`、`android/tests/` | Flutter 与原生参数回归测试 |
@@ -68,7 +72,9 @@ keyPassword=YOUR_KEY_PASSWORD
 
 每个扫描会话只拥有一个进程；停止与迟到启动发生竞争时销毁迟到进程，旧会话不能更新新会话状态。原生层将密集结果事件合并到约 80 ms 一次，日志保留最近 200 条。
 
-请保持应用在前台。页面切换不停止扫描，退出 Activity 会停止扫描；结果尚未持久化。最终结果在扫描及测速结束后显示。失败下载显示“测速失败”，不会按成功速度展示。
+请保持应用在前台。页面切换不停止扫描，退出 Activity 会停止扫描。扫描结束自动保存结果；下次打开会选中最新历史记录。运行期间会保存已收到结果的检查点，异常退出后显示为“已中断”，不会自动继续扫描。最终结果在扫描及测速结束后显示；失败下载显示“测速失败”。
+
+历史记录仅保存在应用私有目录，最多保留最近 50 次。查看历史不会改动正在运行的扫描或当前参数；新扫描也不会清空上一轮记录。卸载应用或清除应用数据会同时删除历史。原生层负责保存，读取或写入失败会提示，并保留此前文件；记录不包含密码、代理配置、完整 URL 或日志。
 
 miuix 1.1.1 导航项高度固定，导航标签缩放限制为 1.2；正文与输入框继续跟随系统字体大小，大字或窄屏时双列输入切为单列。
 
@@ -79,7 +85,7 @@ flutter analyze
 flutter test
 ```
 
-包括参数继承、密码不持久化、无效参数拒绝启动、重复启动保护、停止重启、旧事件隔离、失败测速显示、页面切换、键盘遮挡及长 IPv6/大字体布局。
+包括参数继承、密码不持久化、无效参数拒绝启动、重复启动保护、停止重启、旧事件隔离、失败测速显示、页面切换、键盘遮挡及长 IPv6/大字体布局；历史测试覆盖重启恢复、当前扫描与历史隔离、延迟读取、错误重试和确认删除。仓库根目录的 `scripts/test-android-native.sh` 还会验证真实历史文件的读写、保留数量、脱敏和失败恢复。
 
 可选截图：提供本地字体，使用 `--update-goldens` 生成 `test/review/`：
 
